@@ -1,0 +1,3 @@
+[submodule "vendor/open-strike"]
+	path = vendor/open-strike
+	url = https://github.com/pocket-stack/open-strike.git

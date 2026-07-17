@@ -1,0 +1,43 @@
+[package]
+name = "openstrike-fiber-arena"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Authoritative 1v1 networking and event-driven Fiber payments for OpenStrike"
+
+[features]
+default = []
+openstrike = ["dep:glam", "dep:openstrike-core", "dep:pocket3d-bsp"]
+desktop = ["openstrike", "dep:env_logger", "dep:log", "dep:pocket3d"]
+
+[[bin]]
+name = "arena-desktop"
+path = "src/bin/arena-desktop.rs"
+required-features = ["desktop"]
+
+[dependencies]
+anyhow = "1.0"
+blake3 = "1.8"
+clap = { version = "4.5", features = ["derive", "env"] }
+ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+env_logger = { version = "0.11", optional = true }
+hex = "0.4"
+glam = { version = "0.33", optional = true }
+log = { version = "0.4", optional = true }
+openstrike-core = { path = "vendor/open-strike/crates/openstrike-core", optional = true }
+pocket3d = { path = "vendor/open-strike/vendor/pocketjs/pocket3d/crates/pocket3d", features = ["bsp"], optional = true }
+pocket3d-bsp = { path = "vendor/open-strike/vendor/pocketjs/pocket3d/crates/pocket3d-bsp", optional = true }
+postcard = { version = "1.1", features = ["use-std"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+renet = "2.0"
+renet_netcode = "2.0"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+approx = "0.5"

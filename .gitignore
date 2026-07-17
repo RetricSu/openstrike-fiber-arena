@@ -1,0 +1,13 @@
+/target/
+/work/
+/outputs/
+*.key
+*.token
+/secrets/
+/.env
+*.log
+.DS_Store
+
+# OpenStrike map/texture data is user-supplied and must not be committed.
+/assets/maps/
+/assets/support/
