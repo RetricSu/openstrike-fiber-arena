@@ -6,13 +6,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use ed25519_dalek::SigningKey;
 use openstrike_fiber_arena::{
     PROTOCOL_ID, TICK_HZ,
-    net::{decode_player_name, init_tracing, unix_ms, unix_time},
-    protocol::{ClientMessage, MatchPhase, PlayerSlot, ServerMessage, decode, encode},
+    net::{decode_player_identity, decode_player_name, mock_fiber_pubkey, unix_ms, unix_time},
+    protocol::{
+        ClientMessage, MatchPhase, PlayerBinding, PlayerSlot, ServerMessage, decode, encode,
+    },
     security::load_secret_32,
     settlement::SettlementCoordinator,
     sim::{HarnessSim, MatchEvent, MatchSimulation},
@@ -35,25 +37,34 @@ struct Args {
     damage_bucket: u16,
     #[arg(long, default_value_t = 1_000)]
     amount_per_bucket: u128,
-    #[arg(long, default_value_t = 100_000)]
+    /// Total pre-authorized amount per player. This must be an exact multiple
+    /// of --amount-per-bucket; the default creates four invoices per payer.
+    #[arg(long, default_value_t = 4_000)]
     max_total_per_player: u128,
-    #[arg(long, default_value_t = 2_000)]
+    /// Deadline for a released preimage to be processed by the payee client.
+    #[arg(long, default_value_t = 30_000)]
     payment_deadline_ms: u64,
+    #[arg(long, default_value_t = 7_200)]
+    invoice_expiry_seconds: u64,
+    #[arg(long, default_value_t = 3_600)]
+    hold_payment_timeout_seconds: u64,
+    /// FNN v0.9.0-rc7 production minimum is 160 minutes.
+    #[arg(long, default_value_t = 9_600_000)]
+    final_expiry_delta_ms: u64,
     /// 32-byte Netcode private key file shared only with the token issuer.
     #[arg(long, env = "ARENA_NETCODE_KEY_FILE", conflicts_with = "dev_unsecure")]
     netcode_key: Option<PathBuf>,
-    /// Explicit local-development mode. Production defaults to secure tokens.
+    /// Explicit local-development mode. It uses first-free seats and mock
+    /// Fiber identities; funded play must use secure connect tokens.
     #[arg(long, default_value_t = false)]
     dev_unsecure: bool,
-    /// 32-byte Ed25519 seed file used to sign settlement intents.
+    /// 32-byte Ed25519 seed file used to sign settlement releases.
     #[arg(
         long,
         env = "ARENA_SIGNING_KEY_FILE",
         conflicts_with_all = ["signing_key_hex", "dev_signing_key"]
     )]
     signing_key_file: Option<PathBuf>,
-    /// 32-byte Ed25519 signing seed in hex. A deterministic development key
-    /// is never selected implicitly.
     #[arg(
         long,
         env = "ARENA_SIGNING_KEY_HEX",
@@ -62,24 +73,51 @@ struct Args {
     signing_key_hex: Option<String>,
     #[arg(long, default_value_t = false)]
     dev_signing_key: bool,
-    /// GoldSrc BSP map used by the OpenStrike simulation. Requires the
-    /// `openstrike` Cargo feature; omit it to use the deterministic harness.
     #[cfg(feature = "openstrike")]
     #[arg(long)]
     map: Option<PathBuf>,
-    /// Run an asset-free OpenStrike arena for desktop/network smoke tests.
     #[cfg(feature = "openstrike")]
     #[arg(long, default_value_t = false, conflicts_with = "map")]
     dev_arena: bool,
-    /// Directory containing WAD files referenced by the BSP map.
     #[cfg(feature = "openstrike")]
     #[arg(long = "wad-dir")]
     wad_dirs: Vec<PathBuf>,
 }
 
 fn main() -> Result<()> {
-    init_tracing();
+    openstrike_fiber_arena::net::init_tracing();
     let args = Args::parse();
+    ensure!(args.damage_bucket > 0, "--damage-bucket must be positive");
+    ensure!(
+        args.amount_per_bucket > 0,
+        "--amount-per-bucket must be positive"
+    );
+    ensure!(
+        args.max_total_per_player >= args.amount_per_bucket
+            && args.max_total_per_player % args.amount_per_bucket == 0,
+        "--max-total-per-player must be a positive multiple of --amount-per-bucket"
+    );
+    ensure!(
+        (args.max_total_per_player / args.amount_per_bucket).saturating_mul(2) <= u16::MAX as u128,
+        "configured match cap creates too many hold invoices"
+    );
+    ensure!(
+        args.payment_deadline_ms > 0,
+        "--payment-deadline-ms must be positive"
+    );
+    ensure!(
+        args.invoice_expiry_seconds > 0,
+        "--invoice-expiry-seconds must be positive"
+    );
+    ensure!(
+        args.hold_payment_timeout_seconds > 0,
+        "--hold-payment-timeout-seconds must be positive"
+    );
+    ensure!(
+        (9_600_000..=1_209_600_000).contains(&args.final_expiry_delta_ms),
+        "FNN v0.9.0-rc7 requires --final-expiry-delta-ms between 9600000 and 1209600000"
+    );
+
     let public_addr = args.public_addr.unwrap_or(args.bind);
     let socket = UdpSocket::bind(args.bind)
         .with_context(|| format!("binding authoritative server to {}", args.bind))?;
@@ -99,19 +137,12 @@ fn main() -> Result<()> {
         signing_key_id = %hex::encode(&signing_key.verifying_key().to_bytes()[..8]),
         "loaded settlement signing key"
     );
-    let mut settlement = SettlementCoordinator::new(
-        match_id,
-        signing_key,
-        args.amount_per_bucket,
-        args.damage_bucket,
-        args.max_total_per_player,
-        args.payment_deadline_ms,
-    );
+    let mut settlement: Option<SettlementCoordinator> = None;
     let mut sim = build_simulation(&args)?;
     let mut clients = HashMap::<ClientId, PlayerSlot>::new();
-    let mut names = HashMap::<ClientId, String>::new();
+    let mut players: [Option<PlayerBinding>; 2] = std::array::from_fn(|_| None);
     let mut accepted = HashSet::<PlayerSlot>::new();
-    let initial_snapshot = sim.world_snapshot(match_id, 0, settlement.latest_sequence());
+    let initial_snapshot = sim.world_snapshot(match_id, 0, 0);
     let mut latest_inputs =
         initial_snapshot
             .players
@@ -121,12 +152,13 @@ fn main() -> Result<()> {
                 ..Default::default()
             });
     let mut started = false;
+    let mut ended = false;
     let mut server_tick = 0u64;
     let fixed_step = Duration::from_secs_f64(1.0 / TICK_HZ as f64);
     let mut accumulator = Duration::ZERO;
     let mut last_update = Instant::now();
 
-    info!(%match_id, bind = %args.bind, "arena server ready");
+    info!(%match_id, bind = %args.bind, fnn = "0.9.0-rc7", "arena server ready");
     loop {
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(last_update);
@@ -139,30 +171,72 @@ fn main() -> Result<()> {
             &mut network,
             &transport,
             &mut clients,
-            &mut names,
+            &mut players,
             &mut accepted,
-            settlement.terms(),
-        )?;
-        handle_client_messages(
-            &mut network,
-            &clients,
-            &mut accepted,
-            &mut latest_inputs,
-            &mut settlement,
+            args.dev_unsecure,
+            settlement.is_some(),
         );
 
-        if !started && clients.len() == 2 && accepted.len() == 2 {
+        if settlement.is_none() && clients.len() == 2 {
+            let bound_players = std::array::from_fn(|index| {
+                players[index]
+                    .clone()
+                    .expect("both connected slots have authenticated bindings")
+            });
+            let coordinator = SettlementCoordinator::new(
+                match_id,
+                signing_key.clone(),
+                bound_players,
+                args.amount_per_bucket,
+                args.damage_bucket,
+                args.max_total_per_player,
+                args.payment_deadline_ms,
+                args.invoice_expiry_seconds,
+                args.hold_payment_timeout_seconds,
+                args.final_expiry_delta_ms,
+            );
+            for (&client_id, &slot) in &clients {
+                network.send_message(
+                    client_id,
+                    DefaultChannel::ReliableOrdered,
+                    encode(&ServerMessage::Welcome {
+                        slot,
+                        terms: coordinator.terms().clone(),
+                    })?,
+                );
+            }
+            info!(%match_id, "both authenticated seats bound; preparing hold invoices");
+            settlement = Some(coordinator);
+        }
+
+        if let Some(coordinator) = settlement.as_mut() {
+            handle_client_messages(
+                &mut network,
+                &clients,
+                &mut accepted,
+                &mut latest_inputs,
+                coordinator,
+            );
+        }
+
+        if !started
+            && !ended
+            && clients.len() == 2
+            && accepted.len() == 2
+            && settlement
+                .as_ref()
+                .is_some_and(SettlementCoordinator::all_held)
+        {
             started = true;
             sim.set_phase(MatchPhase::Live);
             broadcast_reliable(&mut network, &ServerMessage::MatchStarted { match_id })?;
-            info!(%match_id, "both players accepted terms; match started");
+            info!(%match_id, "all hold invoices received; match started");
         }
 
         while accumulator >= fixed_step {
             accumulator -= fixed_step;
             server_tick += 1;
-            if started {
-                update_payment_gate(sim.as_mut(), &settlement);
+            if started && !ended {
                 let events = sim.tick(latest_inputs);
                 for event in events {
                     match event {
@@ -179,7 +253,10 @@ fn main() -> Result<()> {
                                 victim_health,
                                 "authoritative damage"
                             );
-                            match settlement.record_damage(
+                            let coordinator = settlement
+                                .as_mut()
+                                .expect("a live match has a settlement coordinator");
+                            match coordinator.record_damage(
                                 attacker,
                                 victim,
                                 amount,
@@ -187,28 +264,62 @@ fn main() -> Result<()> {
                                 sim.state_hash(),
                                 unix_ms(),
                             ) {
-                                Ok(intents) => {
-                                    for intent in intents {
+                                Ok(releases) => {
+                                    for release in releases {
+                                        let payee = release.intent.body.payee;
+                                        let reservation_id = release.intent.body.reservation_id;
                                         info!(
-                                            sequence = intent.body.sequence,
-                                            ?intent.body.payer,
-                                            amount = %intent.body.amount,
-                                            "issuing Fiber settlement intent"
+                                            sequence = release.intent.body.sequence,
+                                            reservation_id,
+                                            ?payee,
+                                            amount = %release.intent.body.amount,
+                                            "releasing Fiber hold-invoice preimage"
                                         );
-                                        broadcast_reliable(
+                                        if let Err(error) = send_reliable_to_slot(
                                             &mut network,
-                                            &ServerMessage::SettlementIntent(intent),
-                                        )?;
+                                            &clients,
+                                            payee,
+                                            &ServerMessage::HoldInvoiceRelease(release),
+                                        ) {
+                                            warn!(
+                                                %error,
+                                                ?payee,
+                                                reservation_id,
+                                                "could not deliver Fiber hold-invoice preimage"
+                                            );
+                                        }
                                     }
                                 }
                                 Err(error) => {
-                                    warn!(%error, ?victim, "could not issue settlement intent");
+                                    warn!(%error, ?victim, "held settlement capacity exhausted");
                                     sim.set_phase(MatchPhase::PaymentPaused { payer: victim });
                                 }
                             }
                         }
                         MatchEvent::Death { killer, victim } => {
                             info!(?killer, ?victim, "match ended");
+                            let coordinator = settlement
+                                .as_mut()
+                                .expect("a live match has a settlement coordinator");
+                            for term in coordinator.cancel_unused() {
+                                if let Err(error) = send_reliable_to_slot(
+                                    &mut network,
+                                    &clients,
+                                    term.payee,
+                                    &ServerMessage::CancelHoldInvoice {
+                                        match_id,
+                                        reservation_id: term.reservation_id,
+                                        payment_hash: term.payment_hash,
+                                    },
+                                ) {
+                                    warn!(
+                                        %error,
+                                        ?term.payee,
+                                        reservation_id = term.reservation_id,
+                                        "could not deliver Fiber hold-invoice cancellation"
+                                    );
+                                }
+                            }
                             broadcast_reliable(
                                 &mut network,
                                 &ServerMessage::MatchEnded {
@@ -216,13 +327,18 @@ fn main() -> Result<()> {
                                     winner: killer,
                                 },
                             )?;
+                            ended = true;
                         }
                     }
                 }
-                let snapshot =
-                    sim.world_snapshot(match_id, server_tick, settlement.latest_sequence());
-                let message = encode(&ServerMessage::Snapshot(snapshot))?;
-                network.broadcast_message(DefaultChannel::Unreliable, message);
+                let latest_sequence = settlement
+                    .as_ref()
+                    .map_or(0, SettlementCoordinator::latest_sequence);
+                let snapshot = sim.world_snapshot(match_id, server_tick, latest_sequence);
+                network.broadcast_message(
+                    DefaultChannel::Unreliable,
+                    encode(&ServerMessage::Snapshot(snapshot))?,
+                );
             }
         }
 
@@ -231,52 +347,84 @@ fn main() -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_connections(
     network: &mut RenetServer,
     transport: &NetcodeServerTransport,
     clients: &mut HashMap<ClientId, PlayerSlot>,
-    names: &mut HashMap<ClientId, String>,
+    players: &mut [Option<PlayerBinding>; 2],
     accepted: &mut HashSet<PlayerSlot>,
-    terms: &openstrike_fiber_arena::protocol::MatchTerms,
-) -> Result<()> {
+    dev_unsecure: bool,
+    terms_issued: bool,
+) {
     while let Some(event) = network.get_event() {
         match event {
             ServerEvent::ClientConnected { client_id } => {
-                let Some(slot) = PlayerSlot::ALL
-                    .into_iter()
-                    .find(|slot| !clients.values().any(|used| used == slot))
-                else {
+                if terms_issued {
+                    warn!(%client_id, "rejecting late connection; reconnect recovery is not enabled");
                     network.disconnect(client_id);
                     continue;
+                }
+                let identity = if dev_unsecure {
+                    let Some(slot) = PlayerSlot::ALL
+                        .into_iter()
+                        .find(|slot| !clients.values().any(|used| used == slot))
+                    else {
+                        network.disconnect(client_id);
+                        continue;
+                    };
+                    let name = transport
+                        .user_data(client_id)
+                        .map(|data| decode_player_name(&data))
+                        .unwrap_or_else(|| format!("player-{client_id}"));
+                    Ok((
+                        slot,
+                        PlayerBinding {
+                            name,
+                            fiber_pubkey: mock_fiber_pubkey(slot).into(),
+                        },
+                    ))
+                } else {
+                    transport
+                        .user_data(client_id)
+                        .ok_or_else(|| "secure token omitted player identity".to_string())
+                        .and_then(|data| decode_player_identity(&data))
                 };
-                let name = transport
-                    .user_data(client_id)
-                    .map(|data| decode_player_name(&data))
-                    .unwrap_or_else(|| format!("player-{client_id}"));
+                let (slot, binding) = match identity {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        warn!(%client_id, %error, "rejecting invalid connect-token identity");
+                        network.disconnect(client_id);
+                        continue;
+                    }
+                };
+                if clients.values().any(|used| *used == slot) {
+                    warn!(%client_id, ?slot, "authenticated seat is already occupied");
+                    network.disconnect(client_id);
+                    continue;
+                }
                 clients.insert(client_id, slot);
-                names.insert(client_id, name.clone());
-                let message = ServerMessage::Welcome {
-                    slot,
-                    terms: terms.clone(),
-                };
-                network.send_message(
-                    client_id,
-                    DefaultChannel::ReliableOrdered,
-                    encode(&message)?,
+                players[slot.index()] = Some(binding.clone());
+                info!(
+                    %client_id,
+                    ?slot,
+                    name = %binding.name,
+                    fiber_pubkey = %binding.fiber_pubkey,
+                    "player identity bound"
                 );
-                info!(%client_id, ?slot, %name, "player connected");
             }
             ServerEvent::ClientDisconnected { client_id, reason } => {
                 let slot = clients.remove(&client_id);
                 if let Some(slot) = slot {
                     accepted.remove(&slot);
+                    if !terms_issued {
+                        players[slot.index()] = None;
+                    }
                 }
-                let name = names.remove(&client_id);
-                warn!(%client_id, ?slot, ?name, %reason, "player disconnected");
+                warn!(%client_id, ?slot, %reason, "player disconnected");
             }
         }
     }
-    Ok(())
 }
 
 fn handle_client_messages(
@@ -295,15 +443,6 @@ fn handle_client_messages(
             if let Ok(ClientMessage::Input(input)) = decode(&bytes) {
                 let input = input.sanitized();
                 if input.sequence >= latest_inputs[slot.index()].sequence {
-                    if input.sequence == 1 {
-                        info!(
-                            ?slot,
-                            yaw = input.yaw,
-                            pitch = input.pitch,
-                            fire = input.fire,
-                            "received first player input"
-                        );
-                    }
                     latest_inputs[slot.index()] = input;
                 }
             }
@@ -315,15 +454,45 @@ fn handle_client_messages(
                     if match_id == settlement.terms().match_id =>
                 {
                     accepted.insert(slot);
-                    info!(?slot, "player accepted match terms");
+                    info!(?slot, "player accepted bound match terms");
                 }
-                Ok(ClientMessage::SettlementAck(ack)) => {
-                    let sequence = ack.settlement_sequence;
-                    let status = ack.status.clone();
-                    if let Err(error) = settlement.acknowledge(slot, ack) {
-                        warn!(?slot, %error, sequence, "rejected settlement acknowledgement");
-                    } else {
-                        info!(?slot, ?status, sequence, "settlement acknowledgement");
+                Ok(ClientMessage::HoldInvoiceOffer(offer)) => {
+                    let forward = offer.clone();
+                    match settlement.register_invoice_offer(slot, offer) {
+                        Ok(payer) => {
+                            if let Err(error) = send_reliable_to_slot(
+                                network,
+                                clients,
+                                payer,
+                                &ServerMessage::HoldInvoiceOffer(forward),
+                            ) {
+                                warn!(%error, ?payer, "could not forward hold invoice");
+                            }
+                        }
+                        Err(error) => warn!(?slot, %error, "rejected hold-invoice offer"),
+                    }
+                }
+                Ok(ClientMessage::HoldInvoiceAck(ack)) => {
+                    let reservation_id = ack.reservation_id;
+                    let stage = ack.stage;
+                    match settlement.acknowledge(slot, ack) {
+                        Ok(()) => info!(?slot, reservation_id, ?stage, "hold-invoice progress"),
+                        Err(error) => {
+                            warn!(?slot, reservation_id, ?stage, %error, "rejected hold-invoice acknowledgement")
+                        }
+                    }
+                }
+                Ok(ClientMessage::HoldInvoiceFailure(failure)) => {
+                    let reservation_id = failure.reservation_id;
+                    let stage = failure.stage;
+                    let message = failure.error.clone();
+                    match settlement.record_failure(slot, &failure) {
+                        Ok(()) => {
+                            warn!(?slot, reservation_id, ?stage, error = %message, "Fiber hold-invoice operation failed")
+                        }
+                        Err(error) => {
+                            warn!(?slot, reservation_id, ?stage, %error, "rejected hold-invoice failure report")
+                        }
                     }
                 }
                 Ok(ClientMessage::Input(_)) => {}
@@ -331,20 +500,6 @@ fn handle_client_messages(
                 Err(error) => warn!(?slot, %error, "failed to decode client message"),
             }
         }
-    }
-}
-
-fn update_payment_gate(sim: &mut dyn MatchSimulation, settlement: &SettlementCoordinator) {
-    match (sim.phase(), settlement.blocking_payer(unix_ms())) {
-        (MatchPhase::Live, Some(payer)) => {
-            warn!(?payer, "payment credit window exceeded; pausing match");
-            sim.set_phase(MatchPhase::PaymentPaused { payer });
-        }
-        (MatchPhase::PaymentPaused { .. }, None) => {
-            info!("all blocking payments cleared; resuming match");
-            sim.set_phase(MatchPhase::Live);
-        }
-        _ => {}
     }
 }
 
@@ -367,6 +522,20 @@ fn build_simulation(args: &Args) -> Result<Box<dyn MatchSimulation>> {
 
     info!("using deterministic development harness");
     Ok(Box::new(HarnessSim::default()))
+}
+
+fn send_reliable_to_slot(
+    network: &mut RenetServer,
+    clients: &HashMap<ClientId, PlayerSlot>,
+    slot: PlayerSlot,
+    message: &ServerMessage,
+) -> Result<()> {
+    let client_id = clients
+        .iter()
+        .find_map(|(client_id, bound_slot)| (*bound_slot == slot).then_some(*client_id))
+        .with_context(|| format!("no connected client for slot {slot:?}"))?;
+    network.send_message(client_id, DefaultChannel::ReliableOrdered, encode(message)?);
+    Ok(())
 }
 
 fn broadcast_reliable(network: &mut RenetServer, message: &ServerMessage) -> Result<()> {

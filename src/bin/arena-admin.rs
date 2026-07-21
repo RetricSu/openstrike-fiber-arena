@@ -1,11 +1,12 @@
 use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
 use openstrike_fiber_arena::{
     PROTOCOL_ID,
-    net::{encode_player_name, unix_time},
+    net::{encode_player_identity, normalize_fiber_pubkey, unix_time},
+    protocol::{PlayerBinding, PlayerSlot},
     security::{load_secret_32, write_private_file, write_public_file},
 };
 use rand_core::{OsRng, RngCore};
@@ -16,6 +17,21 @@ use renet_netcode::ConnectToken;
 struct Args {
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SlotArg {
+    A,
+    B,
+}
+
+impl From<SlotArg> for PlayerSlot {
+    fn from(value: SlotArg) -> Self {
+        match value {
+            SlotArg::A => Self::A,
+            SlotArg::B => Self::B,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -33,6 +49,12 @@ enum Command {
         server: SocketAddr,
         #[arg(long)]
         name: String,
+        /// Fixed 1v1 seat authorized by matchmaking.
+        #[arg(long, value_enum)]
+        slot: SlotArg,
+        /// FNN v0.9.0-rc7 identity pubkey authorized for this player.
+        #[arg(long)]
+        fiber_pubkey: String,
         #[arg(long)]
         output: PathBuf,
         #[arg(long)]
@@ -51,6 +73,8 @@ fn main() -> Result<()> {
             netcode_key,
             server,
             name,
+            slot,
+            fiber_pubkey,
             output,
             client_id,
             expire_seconds,
@@ -59,6 +83,8 @@ fn main() -> Result<()> {
             netcode_key,
             server,
             name,
+            slot.into(),
+            fiber_pubkey,
             output,
             client_id,
             expire_seconds,
@@ -104,6 +130,8 @@ fn issue_token(
     netcode_key: PathBuf,
     server: SocketAddr,
     name: String,
+    slot: PlayerSlot,
+    fiber_pubkey: String,
     output: PathBuf,
     client_id: Option<u64>,
     expire_seconds: u64,
@@ -128,7 +156,15 @@ fn issue_token(
             }
         }
     });
-    let user_data = encode_player_name(&name);
+    let binding = PlayerBinding {
+        name: name.clone(),
+        fiber_pubkey: normalize_fiber_pubkey(&fiber_pubkey)
+            .map_err(anyhow::Error::msg)
+            .context("validating --fiber-pubkey")?,
+    };
+    let user_data = encode_player_identity(slot, &binding)
+        .map_err(anyhow::Error::msg)
+        .context("encoding authenticated player identity")?;
     let token = ConnectToken::generate(
         unix_time(),
         PROTOCOL_ID,
@@ -144,7 +180,8 @@ fn issue_token(
     token.write(&mut bytes).context("encoding connect token")?;
     write_private_file(&output, &bytes)?;
     println!(
-        "issued token for {name} (client {client_id}) to {}",
+        "issued token for {name} as {slot:?} with Fiber {} (client {client_id}) to {}",
+        binding.fiber_pubkey,
         output.display()
     );
     Ok(())
