@@ -8,5 +8,6 @@ pub mod security;
 pub mod settlement;
 pub mod sim;
 
-pub const PROTOCOL_ID: u64 = 0x4f53_4649_4245_5231;
+// "OSFIBER2": the hold-invoice and token-bound Fiber identity wire protocol.
+pub const PROTOCOL_ID: u64 = 0x4f53_4649_4245_5232;
 pub const TICK_HZ: u64 = 64;

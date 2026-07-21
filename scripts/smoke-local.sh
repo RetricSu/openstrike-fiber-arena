@@ -37,9 +37,9 @@ wait "$alice_pid"
 wait "$bob_pid"
 sleep 0.3
 
-rg -q "both players accepted terms; match started" "$log_dir/server.log"
-rg -q "issuing Fiber settlement intent" "$log_dir/server.log"
-rg -q "settlement acknowledgement" "$log_dir/server.log"
+rg -q "all hold invoices received; match started" "$log_dir/server.log"
+rg -q "releasing Fiber hold-invoice preimage" "$log_dir/server.log"
+rg -q "stage=Settled" "$log_dir/server.log"
 rg -q "match ended" "$log_dir/server.log"
 
 echo "Smoke test passed. Logs: $log_dir"

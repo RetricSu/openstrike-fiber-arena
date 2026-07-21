@@ -1,22 +1,23 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::VecDeque,
     net::{SocketAddr, UdpSocket},
     path::PathBuf,
     sync::{Arc, mpsc},
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use openstrike_core::Player;
 use openstrike_fiber_arena::{
     TICK_HZ,
     client::SettlementGuard,
-    fiber::{FiberRpcClient, mock_success_ack},
+    fiber::{FiberCurrency, FiberRpcClient, HoldInvoiceExpectation},
     net::{unix_ms, unix_time},
     protocol::{
-        ClientMessage, InputFrame, MatchPhase, PaymentStatus, PlayerSlot, PlayerSnapshot,
-        ServerMessage, SettlementAck, SettlementIntent, decode, encode,
+        ClientMessage, HoldInvoiceAck, HoldInvoiceFailure, HoldInvoiceOffer, HoldInvoiceRelease,
+        HoldInvoiceStage, HoldInvoiceTerm, InputFrame, MatchPhase, MatchTerms, PlayerSlot,
+        PlayerSnapshot, ServerMessage, decode, encode,
     },
     security::client_authentication,
 };
@@ -64,8 +65,8 @@ struct Args {
     mock_payments: bool,
     #[arg(long, env = "FIBER_RPC_URL")]
     fiber_rpc: Option<String>,
-    #[arg(long, env = "FIBER_PEER_PUBKEY", requires = "fiber_rpc")]
-    peer_pubkey: Option<String>,
+    #[arg(long, env = "FIBER_CURRENCY", default_value = "Fibt")]
+    fiber_currency: FiberCurrency,
     #[arg(long)]
     soldier_model: Option<PathBuf>,
     #[arg(long, default_value_t = false)]
@@ -78,7 +79,7 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
     if !args.mock_payments && args.fiber_rpc.is_none() {
-        bail!("choose --mock-payments or configure --fiber-rpc and --peer-pubkey");
+        bail!("choose --mock-payments or configure --fiber-rpc");
     }
 
     let map = match &args.map {
@@ -257,6 +258,7 @@ impl RemoteTrack {
 }
 
 struct DesktopGame {
+    player_name: String,
     map: MapData,
     dev_arena: bool,
     scene: Scene,
@@ -284,11 +286,11 @@ struct DesktopGame {
     status: String,
     mock_payments: bool,
     fiber: Option<FiberRpcClient>,
-    peer_pubkey: Option<String>,
+    fiber_currency: FiberCurrency,
     payment_runtime: Option<tokio::runtime::Runtime>,
-    payment_tx: mpsc::Sender<SettlementAck>,
-    payment_rx: mpsc::Receiver<SettlementAck>,
-    pending_payments: HashSet<u64>,
+    payment_tx: mpsc::Sender<ClientMessage>,
+    payment_rx: mpsc::Receiver<ClientMessage>,
+    pending_operations: usize,
     match_end_received: bool,
     exit_on_end: bool,
     auto_fire: bool,
@@ -328,6 +330,7 @@ impl DesktopGame {
         log::info!("connecting to {}", args.server);
         let predictor = Predictor::new(spawn_position, spawn_yaw, args.dev_arena);
         Ok(Self {
+            player_name: args.name.clone(),
             map,
             dev_arena: args.dev_arena,
             scene: Scene::default(),
@@ -358,11 +361,11 @@ impl DesktopGame {
             status: "CONNECTING".into(),
             mock_payments: args.mock_payments,
             fiber,
-            peer_pubkey: args.peer_pubkey.clone(),
+            fiber_currency: args.fiber_currency,
             payment_runtime,
             payment_tx,
             payment_rx,
-            pending_payments: HashSet::new(),
+            pending_operations: 0,
             match_end_received: false,
             exit_on_end: args.exit_on_end,
             auto_fire: args.auto_fire,
@@ -395,7 +398,7 @@ impl DesktopGame {
                 self.apply_snapshot(snapshot);
             }
         }
-        self.drain_payment_results();
+        self.drain_fiber_results();
 
         if self.running
             && self.phase == MatchPhase::Live
@@ -449,19 +452,29 @@ impl DesktopGame {
         match message {
             ServerMessage::Welcome { slot, terms } => {
                 let match_id = terms.match_id;
+                if let Err(error) = self.prepare_hold_invoices(slot, &terms) {
+                    self.fail(format!("Fiber hold-invoice setup failed: {error:#}"));
+                    return;
+                }
                 self.slot = Some(slot);
                 self.guard = Some(SettlementGuard::new(terms));
-                self.status = format!("READY AS {slot:?}");
+                self.status = format!("LOCKING HOLDS AS {slot:?}");
                 self.send_control(ClientMessage::AcceptTerms { match_id });
-                log::info!("joined match {match_id} as {slot:?}");
+                log::info!("joined bound match {match_id} as {slot:?}");
             }
+            ServerMessage::HoldInvoiceOffer(offer) => self.handle_invoice_offer(offer),
             ServerMessage::MatchStarted { match_id } => {
                 self.running = true;
                 self.status = "LIVE".into();
-                log::info!("match {match_id} started");
+                log::info!("match {match_id} started after all holds reached Received");
             }
             ServerMessage::Snapshot(snapshot) => self.apply_snapshot(snapshot),
-            ServerMessage::SettlementIntent(intent) => self.handle_settlement_intent(intent),
+            ServerMessage::HoldInvoiceRelease(release) => self.handle_invoice_release(release),
+            ServerMessage::CancelHoldInvoice {
+                match_id,
+                reservation_id,
+                payment_hash,
+            } => self.handle_invoice_cancel(match_id, reservation_id, payment_hash),
             ServerMessage::MatchEnded { match_id, winner } => {
                 self.running = false;
                 self.match_end_received = true;
@@ -470,6 +483,116 @@ impl DesktopGame {
             }
             ServerMessage::Error(message) => self.fail(format!("server error: {message}")),
         }
+    }
+
+    fn prepare_hold_invoices(&mut self, slot: PlayerSlot, terms: &MatchTerms) -> Result<()> {
+        let binding = &terms.players[slot.index()];
+        ensure!(
+            binding.name == self.player_name,
+            "connect token is bound to {}, not {}",
+            binding.name,
+            self.player_name
+        );
+
+        if self.mock_payments {
+            for term in terms.hold_invoices.iter().filter(|term| term.payee == slot) {
+                self.send_control(ClientMessage::HoldInvoiceOffer(HoldInvoiceOffer {
+                    match_id: terms.match_id,
+                    reservation_id: term.reservation_id,
+                    payment_hash: term.payment_hash,
+                    invoice: format!(
+                        "mock:{}:{}:{}",
+                        terms.match_id,
+                        term.reservation_id,
+                        hex::encode(term.payment_hash)
+                    ),
+                }));
+                self.send_control(ClientMessage::HoldInvoiceAck(hold_ack(
+                    terms.match_id,
+                    term,
+                    HoldInvoiceStage::Received,
+                )));
+            }
+            return Ok(());
+        }
+
+        let rpc = self.fiber.clone().context("Fiber RPC unavailable")?;
+        let handle = self
+            .payment_runtime
+            .as_ref()
+            .context("Fiber runtime unavailable")?
+            .handle()
+            .clone();
+        let currency = self.fiber_currency;
+        let local_pubkey = binding.fiber_pubkey.clone();
+        let opponent_pubkey = terms.players[slot.opponent().index()].fiber_pubkey.clone();
+        let payee_terms: Vec<_> = terms
+            .hold_invoices
+            .iter()
+            .filter(|term| term.payee == slot)
+            .cloned()
+            .collect();
+        let created = self
+            .payment_runtime
+            .as_ref()
+            .expect("validated Fiber runtime")
+            .block_on(async {
+                let readiness = rpc
+                    .check_direct_channel(&opponent_pubkey, terms.max_total_per_player)
+                    .await?;
+                if readiness.node.pubkey != local_pubkey {
+                    return Err(openstrike_fiber_arena::fiber::FiberError::InvoiceMismatch(
+                        format!(
+                            "local FNN pubkey {} differs from connect-token binding {}",
+                            readiness.node.pubkey, local_pubkey
+                        ),
+                    ));
+                }
+                let mut invoices = Vec::with_capacity(payee_terms.len());
+                for term in payee_terms {
+                    let expectation =
+                        HoldInvoiceExpectation::new(terms, &term, &local_pubkey, currency)?;
+                    let invoice = rpc.create_hold_invoice(&expectation).await?;
+                    invoices.push((term, invoice));
+                }
+                Ok::<_, openstrike_fiber_arena::fiber::FiberError>((readiness, invoices))
+            })?;
+        log::info!(
+            "bound Fiber channel ready: FNN {} channel {} outbound {}",
+            created.0.node.version,
+            created.0.channel.channel_id,
+            created.0.channel.local_balance
+        );
+        for (term, invoice) in created.1 {
+            self.send_control(ClientMessage::HoldInvoiceOffer(HoldInvoiceOffer {
+                match_id: terms.match_id,
+                reservation_id: term.reservation_id,
+                payment_hash: term.payment_hash,
+                invoice,
+            }));
+            self.pending_operations += 1;
+            let rpc = rpc.clone();
+            let tx = self.payment_tx.clone();
+            let match_id = terms.match_id;
+            let timeout = Duration::from_millis(terms.payment_deadline_ms);
+            handle.spawn(async move {
+                let message = match rpc.wait_invoice_received(term.payment_hash, timeout).await {
+                    Ok(()) => ClientMessage::HoldInvoiceAck(hold_ack(
+                        match_id,
+                        &term,
+                        HoldInvoiceStage::Received,
+                    )),
+                    Err(error) => ClientMessage::HoldInvoiceFailure(hold_failure(
+                        match_id,
+                        &term,
+                        HoldInvoiceStage::Received,
+                        error.to_string(),
+                    )),
+                };
+                tx.send(message).ok();
+            });
+        }
+        Ok(())
     }
 
     fn apply_snapshot(&mut self, snapshot: openstrike_fiber_arena::protocol::WorldSnapshot) {
@@ -488,42 +611,45 @@ impl DesktopGame {
         self.remote.update(remote);
     }
 
-    fn handle_settlement_intent(&mut self, intent: SettlementIntent) {
+    fn handle_invoice_offer(&mut self, offer: HoldInvoiceOffer) {
         let Some(slot) = self.slot else {
             return;
         };
-        if intent.body.payer != slot {
-            log::info!(
-                "opponent payment requested: sequence {} amount {}",
-                intent.body.sequence,
-                intent.body.amount
-            );
-            return;
-        }
-        let Some(guard) = self.guard.as_mut() else {
+        let Some(guard) = self.guard.as_ref() else {
             return;
         };
-        let timeout_ms = guard.terms().payment_deadline_ms;
-        if let Err(error) = guard.validate(&intent, unix_ms()) {
-            log::warn!("refusing settlement {}: {error}", intent.body.sequence);
-            self.send_control(ClientMessage::SettlementAck(SettlementAck {
-                match_id: intent.body.match_id,
-                settlement_sequence: intent.body.sequence,
-                payment_hash: None,
-                status: PaymentStatus::Failed { error },
-            }));
+        if offer.match_id != guard.terms().match_id {
+            self.fail("hold invoice belongs to another match".into());
             return;
         }
-
-        let sequence = intent.body.sequence;
-        self.pending_payments.insert(sequence);
-        self.status = format!("PAYING #{sequence}");
+        let Some(term) = guard
+            .terms()
+            .hold_invoices
+            .iter()
+            .find(|term| term.reservation_id == offer.reservation_id)
+            .cloned()
+        else {
+            self.fail("unknown hold-invoice reservation".into());
+            return;
+        };
+        if term.payer != slot || term.payment_hash != offer.payment_hash {
+            self.fail("hold-invoice offer conflicts with bound match terms".into());
+            return;
+        }
         if self.mock_payments {
-            self.payment_tx.send(mock_success_ack(&intent)).ok();
+            self.send_control(ClientMessage::HoldInvoiceAck(hold_ack(
+                guard.terms().match_id,
+                &term,
+                HoldInvoiceStage::Funded,
+            )));
             return;
         }
 
-        let Some(runtime) = &self.payment_runtime else {
+        let Some(handle) = self
+            .payment_runtime
+            .as_ref()
+            .map(|runtime| runtime.handle().clone())
+        else {
             self.fail("Fiber runtime unavailable".into());
             return;
         };
@@ -531,42 +657,219 @@ impl DesktopGame {
             self.fail("Fiber RPC unavailable".into());
             return;
         };
-        let Some(target) = self.peer_pubkey.clone() else {
-            self.fail("Fiber peer public key unavailable".into());
-            return;
-        };
+        let terms = guard.terms().clone();
+        let currency = self.fiber_currency;
         let tx = self.payment_tx.clone();
-        runtime.spawn(async move {
-            let ack = match rpc
-                .execute_intent(&intent, &target, Duration::from_millis(timeout_ms))
+        self.pending_operations += 1;
+        self.status = format!("LOCKING HOLD #{}", term.reservation_id);
+        handle.spawn(async move {
+            let result = async {
+                let expectation = HoldInvoiceExpectation::new(
+                    &terms,
+                    &term,
+                    &terms.players[term.payee.index()].fiber_pubkey,
+                    currency,
+                )?;
+                rpc.fund_hold_invoice(
+                    &offer.invoice,
+                    &expectation,
+                    terms.hold_payment_timeout_seconds,
+                )
                 .await
-            {
-                Ok(ack) => ack,
-                Err(error) => SettlementAck {
-                    match_id: intent.body.match_id,
-                    settlement_sequence: intent.body.sequence,
-                    payment_hash: None,
-                    status: PaymentStatus::Failed {
-                        error: error.to_string(),
-                    },
-                },
+            }
+            .await;
+            let message = match result {
+                Ok(_) => ClientMessage::HoldInvoiceAck(hold_ack(
+                    terms.match_id,
+                    &term,
+                    HoldInvoiceStage::Funded,
+                )),
+                Err(error) => ClientMessage::HoldInvoiceFailure(hold_failure(
+                    terms.match_id,
+                    &term,
+                    HoldInvoiceStage::Funded,
+                    error.to_string(),
+                )),
             };
-            tx.send(ack).ok();
+            tx.send(message).ok();
         });
     }
 
-    fn drain_payment_results(&mut self) {
-        while let Ok(ack) = self.payment_rx.try_recv() {
-            let sequence = ack.settlement_sequence;
-            let successful = matches!(ack.status, PaymentStatus::Success);
-            log::info!("payment #{sequence} completed: {:?}", ack.status);
-            self.send_control(ClientMessage::SettlementAck(ack));
-            self.pending_payments.remove(&sequence);
-            self.status = if successful {
-                "LIVE — PAYMENT CONFIRMED".into()
-            } else {
-                "PAYMENT FAILED".into()
+    fn handle_invoice_release(&mut self, release: HoldInvoiceRelease) {
+        let Some(slot) = self.slot else {
+            return;
+        };
+        let Some(guard) = self.guard.as_mut() else {
+            return;
+        };
+        if let Err(error) = guard.validate_release(&release, slot, unix_ms()) {
+            log::warn!(
+                "refusing hold release {}: {error}",
+                release.intent.body.reservation_id
+            );
+            self.send_control(ClientMessage::HoldInvoiceFailure(HoldInvoiceFailure {
+                match_id: release.intent.body.match_id,
+                reservation_id: release.intent.body.reservation_id,
+                payment_hash: release.intent.body.payment_hash,
+                stage: HoldInvoiceStage::Settled,
+                error,
+            }));
+            return;
+        }
+        let term = guard
+            .terms()
+            .hold_invoices
+            .iter()
+            .find(|term| term.reservation_id == release.intent.body.reservation_id)
+            .expect("validated hold reservation")
+            .clone();
+        let terms = guard.terms().clone();
+        if self.mock_payments {
+            self.send_control(ClientMessage::HoldInvoiceAck(hold_ack(
+                terms.match_id,
+                &term,
+                HoldInvoiceStage::Settled,
+            )));
+            return;
+        }
+        let Some(handle) = self
+            .payment_runtime
+            .as_ref()
+            .map(|runtime| runtime.handle().clone())
+        else {
+            self.fail("Fiber runtime unavailable".into());
+            return;
+        };
+        let Some(rpc) = self.fiber.clone() else {
+            self.fail("Fiber RPC unavailable".into());
+            return;
+        };
+        let tx = self.payment_tx.clone();
+        self.pending_operations += 1;
+        self.status = format!("SETTLING HOLD #{}", term.reservation_id);
+        handle.spawn(async move {
+            let result = rpc
+                .settle_hold_invoice(
+                    term.payment_hash,
+                    release.payment_preimage,
+                    Duration::from_millis(terms.payment_deadline_ms),
+                )
+                .await;
+            let message = match result {
+                Ok(()) => ClientMessage::HoldInvoiceAck(hold_ack(
+                    terms.match_id,
+                    &term,
+                    HoldInvoiceStage::Settled,
+                )),
+                Err(error) => ClientMessage::HoldInvoiceFailure(hold_failure(
+                    terms.match_id,
+                    &term,
+                    HoldInvoiceStage::Settled,
+                    error.to_string(),
+                )),
             };
+            tx.send(message).ok();
+        });
+    }
+
+    fn handle_invoice_cancel(
+        &mut self,
+        match_id: u128,
+        reservation_id: u16,
+        payment_hash: [u8; 32],
+    ) {
+        let Some(slot) = self.slot else {
+            return;
+        };
+        let Some(guard) = self.guard.as_ref() else {
+            return;
+        };
+        let Some(term) = guard
+            .terms()
+            .hold_invoices
+            .iter()
+            .find(|term| term.reservation_id == reservation_id)
+            .cloned()
+        else {
+            self.fail("server requested cancellation of unknown hold".into());
+            return;
+        };
+        if match_id != guard.terms().match_id
+            || term.payee != slot
+            || term.payment_hash != payment_hash
+        {
+            self.fail("invalid hold-invoice cancellation request".into());
+            return;
+        }
+        if self.mock_payments {
+            self.send_control(ClientMessage::HoldInvoiceAck(hold_ack(
+                match_id,
+                &term,
+                HoldInvoiceStage::Cancelled,
+            )));
+            return;
+        }
+        let Some(handle) = self
+            .payment_runtime
+            .as_ref()
+            .map(|runtime| runtime.handle().clone())
+        else {
+            self.fail("Fiber runtime unavailable".into());
+            return;
+        };
+        let Some(rpc) = self.fiber.clone() else {
+            self.fail("Fiber RPC unavailable".into());
+            return;
+        };
+        let tx = self.payment_tx.clone();
+        self.pending_operations += 1;
+        handle.spawn(async move {
+            let result = rpc.cancel_hold_invoice(term.payment_hash).await;
+            let message = match result {
+                Ok(()) => ClientMessage::HoldInvoiceAck(hold_ack(
+                    match_id,
+                    &term,
+                    HoldInvoiceStage::Cancelled,
+                )),
+                Err(error) => ClientMessage::HoldInvoiceFailure(hold_failure(
+                    match_id,
+                    &term,
+                    HoldInvoiceStage::Cancelled,
+                    error.to_string(),
+                )),
+            };
+            tx.send(message).ok();
+        });
+    }
+
+    fn drain_fiber_results(&mut self) {
+        while let Ok(message) = self.payment_rx.try_recv() {
+            self.pending_operations = self.pending_operations.saturating_sub(1);
+            match &message {
+                ClientMessage::HoldInvoiceAck(ack) => {
+                    log::info!(
+                        "hold #{} completed stage {:?}",
+                        ack.reservation_id,
+                        ack.stage
+                    );
+                    self.status = if self.running {
+                        "LIVE — FIBER SETTLED".into()
+                    } else {
+                        "PREPARING FIBER HOLDS".into()
+                    };
+                }
+                ClientMessage::HoldInvoiceFailure(failure) => {
+                    log::warn!(
+                        "hold #{} {:?} failed: {}",
+                        failure.reservation_id,
+                        failure.stage,
+                        failure.error
+                    );
+                    self.status = "FIBER HOLD FAILED".into();
+                }
+                _ => {}
+            }
+            self.send_control(message);
         }
     }
 
@@ -754,10 +1057,13 @@ impl DesktopGame {
             );
         }
         if let Some(guard) = &self.guard {
+            let released = PlayerSlot::ALL
+                .into_iter()
+                .map(|payer| guard.released_total(payer))
+                .sum::<u128>();
             let text = format!(
-                "FIBER COMMITTED {}  PENDING {}",
-                guard.committed_total(),
-                self.pending_payments.len()
+                "FIBER RELEASED {}  OPS {}",
+                released, self.pending_operations
             );
             let text_width = Hud::text_width(&text, 1.5);
             self.hud.text(
@@ -835,7 +1141,31 @@ impl Game for DesktopGame {
     }
 
     fn wants_exit(&self) -> bool {
-        self.exit_on_end && self.match_end_received && self.pending_payments.is_empty()
+        self.exit_on_end && self.match_end_received && self.pending_operations == 0
+    }
+}
+
+fn hold_ack(match_id: u128, term: &HoldInvoiceTerm, stage: HoldInvoiceStage) -> HoldInvoiceAck {
+    HoldInvoiceAck {
+        match_id,
+        reservation_id: term.reservation_id,
+        payment_hash: term.payment_hash,
+        stage,
+    }
+}
+
+fn hold_failure(
+    match_id: u128,
+    term: &HoldInvoiceTerm,
+    stage: HoldInvoiceStage,
+    error: String,
+) -> HoldInvoiceFailure {
+    HoldInvoiceFailure {
+        match_id,
+        reservation_id: term.reservation_id,
+        payment_hash: term.payment_hash,
+        stage,
+        error,
     }
 }
 

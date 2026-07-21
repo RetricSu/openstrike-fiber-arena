@@ -3,65 +3,101 @@
 ## Runtime flow
 
 ```text
+short-lived Netcode token
+  = player name + fixed A/B seat + FNN identity pubkey
+                         |
+                         v
 Player A client ---- InputFrame ----\
                                     +--> authoritative arena server
 Player B client ---- InputFrame ----/             |
-                                                 | SettlementIntent
-                            WorldSnapshot <-------+-------> client FiberAdapter
-                                                               |
-                                                               v
-                                                     local Fiber node RPC
-                                                               |
-                                                     direct Fiber channel
+                            WorldSnapshot <--------+
+                                                   |
+                                  signed preimage release on damage
+                                                   |
+                                                   v
+                                         payee's local FNN
+                                           settle_invoice
+                                                   |
+                                         off-chain channel update
 ```
 
-`SettlementIntent` contains a monotonically increasing sequence, match and game
-tick identifiers, payer/payee slots, amount, state hash, expiry, and an Ed25519
-server signature. The game process never receives a wallet private key.
+Renet and Fiber remain separate. Renet carries input, authoritative snapshots,
+match setup, invoice offers, dual readiness acknowledgements, and preimages.
+Each local FNN owns its wallet keys and performs all invoice/payment RPC calls.
+The arena server never receives a wallet key or FNN RPC credential.
+
+## Hold-invoice lifecycle
+
+The server generates four random preimages per payer by default and publishes
+only their SHA-256 hashes in `MatchTerms`.
+
+1. The future payee creates a signed FNN hold invoice for each server hash.
+2. The server forwards the invoice to the bound payer.
+3. The payer asks its own FNN to parse the invoice and checks currency, amount,
+   payment hash, SHA-256 algorithm, signature presence, match/reservation
+   description, invoice expiry, final expiry delta, and the token-bound payee
+   pubkey before calling `send_payment`.
+4. The payer reports `Funded`; the payee independently polls `get_invoice` and
+   reports `Received`. Both reports are required for every invoice.
+5. The server starts the match only after both players accept the terms and all
+   reservations are held.
+6. Each authoritative damage bucket consumes one held reservation. The server
+   signs the game event and sends the matching preimage only to the payee. The
+   payee calls `settle_invoice`; the payer no longer has a refusal point.
+7. At match end the server tells each payee to cancel unused invoices.
 
 ## Trust model
 
-The server is the match oracle: it decides hits and signs settlement intents.
-Each player explicitly accepts match terms containing the per-event and total
-payment caps. A local adapter refuses unsigned, expired, duplicate, or
-over-budget intents.
+The server remains the trusted game oracle. It decides hits, damage, invoice
+hashes, and when to release preimages. A malicious server can incorrectly
+consume the amount pre-authorized for one match, but it never receives wallet
+keys and cannot exceed the invoice set accepted before play.
 
-Opening a funded channel does not let the opponent pull money. A player can stop
-their adapter and refuse a payment. The current implementation limits this
-exposure with a small credit window: gameplay pauses while an intent is overdue.
-A timed forfeit rule can be layered on once match lifecycle policy is fixed.
+The payment setup is resistant to one malicious player:
 
-This is not trustless game-result arbitration. Adding that later requires
-signed input logs and a replay/challenge mechanism.
+- a payer cannot start by fabricating `Funded`, because the payee must observe
+  its own invoice in `Received`;
+- a payee cannot redirect or inflate an invoice, because the payer's own FNN
+  parses it and the client compares all security-critical fields;
+- a payee can lie about `Received`, but that only starts without protecting its
+  own future income.
 
-## Transport channels
+This is not trustless game-result arbitration and it is not an independent
+third-party proof of Fiber payment state. Those require a protocol-level signed
+receipt or a server escrow/hub, neither of which is exposed by the current FNN
+RPC without changing the P2P payment model.
+
+## Identity and transport
+
+Production clients use short-lived encrypted Netcode `ConnectToken`s. Token
+user data contains the authorized player name, fixed `PlayerSlot`, and the
+FNN v0.9.0-rc7 compressed secp256k1 identity pubkey. The server rejects duplicate
+seats and waits for both bindings before constructing immutable match terms.
+The client verifies that its local `node_info.pubkey` equals its token binding;
+the opponent pubkey is taken from match terms rather than a command-line flag.
+
+`--dev-unsecure` deliberately falls back to first-free seats and deterministic
+mock pubkeys. It is for local/mock play only and cannot pass a real-FNN identity
+check.
+
+Settlement releases use a separate file-backed Ed25519 key so transport
+authentication and game-event authorization do not share a secret.
 
 | Renet channel | Direction | Payload |
 | --- | --- | --- |
 | unreliable | client -> server | sequenced input frames |
 | unreliable | server -> client | authoritative snapshots |
-| reliable ordered | both | join, match lifecycle, settlement intent/ack |
-
-Production clients receive a short-lived Netcode `ConnectToken` from the
-matchmaker. The token authenticates the client id and player metadata and
-contains per-connection encryption keys; only the server/token issuer knows the
-32-byte Netcode private key. `--dev-unsecure` is an explicit local-only escape
-hatch.
-
-Settlement intents use a separate Ed25519 key so transport authentication and
-payment authorization do not share a secret or failure domain. Clients receive
-the verification key in accepted match terms. The server loads the signing seed
-from a mode-`0600` file and has no implicit production fallback.
+| reliable ordered | both | setup, invoices, receipts, preimages, lifecycle |
 
 ## Fiber channel shape
 
-For the first direct P2P demo, each player pre-funds their maximum exposure:
+For the symmetric 1v1 demo, each player needs reusable outbound liquidity:
 
 ```text
-A -- one-way channel --> B
-B -- one-way channel --> A
+A FNN -- funded one-way channel --> B FNN
+B FNN -- funded one-way channel --> A FNN
 ```
 
-Payments are triggered by authoritative damage buckets rather than frames. The
-default harness emits one payment per 25 damage. Fiber payment failures never
-block the 64 Hz simulation thread; they are handled by an asynchronous worker.
+A bidirectional channel with sufficient balance on both sides also works. The
+server never opens or closes channels. Match payments and hold settlements are
+off-chain updates; channel lifecycle remains a CKB L1 operation.

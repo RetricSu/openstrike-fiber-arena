@@ -86,13 +86,35 @@ pub struct WorldSnapshot {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlayerBinding {
+    pub name: String,
+    /// FNN v0.9.0-rc7 node identity: a compressed secp256k1 public key encoded as
+    /// 66 lowercase hexadecimal characters without a `0x` prefix.
+    pub fiber_pubkey: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HoldInvoiceTerm {
+    pub reservation_id: u16,
+    pub payer: PlayerSlot,
+    pub payee: PlayerSlot,
+    pub amount: u128,
+    pub payment_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MatchTerms {
     pub match_id: u128,
     pub amount_per_damage_bucket: u128,
     pub damage_bucket: u16,
     pub max_total_per_player: u128,
     pub payment_deadline_ms: u64,
+    pub invoice_expiry_seconds: u64,
+    pub hold_payment_timeout_seconds: u64,
+    pub final_expiry_delta_ms: u64,
     pub server_verifying_key: [u8; 32],
+    pub players: [PlayerBinding; 2],
+    pub hold_invoices: Vec<HoldInvoiceTerm>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -105,10 +127,12 @@ pub enum SettlementReason {
 pub struct UnsignedSettlementIntent {
     pub match_id: u128,
     pub sequence: u64,
+    pub reservation_id: u16,
     pub game_tick: u64,
     pub payer: PlayerSlot,
     pub payee: PlayerSlot,
     pub amount: u128,
+    pub payment_hash: [u8; 32],
     pub reason: SettlementReason,
     pub state_hash: [u8; 32],
     pub expires_at_ms: u64,
@@ -163,34 +187,74 @@ impl SettlementIntent {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum PaymentStatus {
-    Pending,
-    Success,
-    Failed { error: String },
+pub struct HoldInvoiceOffer {
+    pub match_id: u128,
+    pub reservation_id: u16,
+    pub payment_hash: [u8; 32],
+    pub invoice: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum HoldInvoiceStage {
+    Funded,
+    Received,
+    Settled,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct SettlementAck {
+pub struct HoldInvoiceAck {
     pub match_id: u128,
-    pub settlement_sequence: u64,
-    pub payment_hash: Option<[u8; 32]>,
-    pub status: PaymentStatus,
+    pub reservation_id: u16,
+    pub payment_hash: [u8; 32],
+    pub stage: HoldInvoiceStage,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HoldInvoiceFailure {
+    pub match_id: u128,
+    pub reservation_id: u16,
+    pub payment_hash: [u8; 32],
+    pub stage: HoldInvoiceStage,
+    pub error: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HoldInvoiceRelease {
+    pub intent: SettlementIntent,
+    pub payment_preimage: [u8; 32],
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum ClientMessage {
     Input(InputFrame),
     AcceptTerms { match_id: u128 },
-    SettlementAck(SettlementAck),
+    HoldInvoiceOffer(HoldInvoiceOffer),
+    HoldInvoiceAck(HoldInvoiceAck),
+    HoldInvoiceFailure(HoldInvoiceFailure),
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum ServerMessage {
-    Welcome { slot: PlayerSlot, terms: MatchTerms },
-    MatchStarted { match_id: u128 },
+    Welcome {
+        slot: PlayerSlot,
+        terms: MatchTerms,
+    },
+    HoldInvoiceOffer(HoldInvoiceOffer),
+    MatchStarted {
+        match_id: u128,
+    },
     Snapshot(WorldSnapshot),
-    SettlementIntent(SettlementIntent),
-    MatchEnded { match_id: u128, winner: PlayerSlot },
+    HoldInvoiceRelease(HoldInvoiceRelease),
+    CancelHoldInvoice {
+        match_id: u128,
+        reservation_id: u16,
+        payment_hash: [u8; 32],
+    },
+    MatchEnded {
+        match_id: u128,
+        winner: PlayerSlot,
+    },
     Error(String),
 }
 
@@ -210,10 +274,12 @@ mod tests {
         UnsignedSettlementIntent {
             match_id: 9,
             sequence: 3,
+            reservation_id: 2,
             game_tick: 64,
             payer: PlayerSlot::B,
             payee: PlayerSlot::A,
             amount: 100,
+            payment_hash: [6; 32],
             reason: SettlementReason::Damage { amount: 25 },
             state_hash: [4; 32],
             expires_at_ms: 20_000,

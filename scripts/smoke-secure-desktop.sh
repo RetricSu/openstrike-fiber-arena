@@ -11,11 +11,13 @@ cargo build --all-features --bins
 ./target/debug/arena-admin keygen --out-dir "$run_dir/keys"
 ./target/debug/arena-admin issue-token \
   --netcode-key "$run_dir/keys/netcode.key" \
-  --server "127.0.0.1:$port" --name alice \
+  --server "127.0.0.1:$port" --name alice --slot a \
+  --fiber-pubkey 0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 \
   --output "$run_dir/alice.token"
 ./target/debug/arena-admin issue-token \
   --netcode-key "$run_dir/keys/netcode.key" \
-  --server "127.0.0.1:$port" --name bob \
+  --server "127.0.0.1:$port" --name bob --slot b \
+  --fiber-pubkey 02c6047f9441ed7d6d3045406e95c07cd85a778e4b8cef3ca7abac09b95c709ee5 \
   --output "$run_dir/bob.token"
 
 RUST_LOG=info ./target/debug/arena-server \
@@ -50,14 +52,14 @@ wait "$alice_pid"
 wait "$bob_pid"
 sleep 0.3
 
-rg -q "player connected.*name=alice" "$run_dir/server.log"
-rg -q "player connected.*name=bob" "$run_dir/server.log"
+rg -q "player identity bound.*slot=A.*name=alice" "$run_dir/server.log"
+rg -q "player identity bound.*slot=B.*name=bob" "$run_dir/server.log"
 rg -q "authoritative damage attacker=A victim=B" "$run_dir/server.log"
 rg -q "authoritative damage attacker=B victim=A" "$run_dir/server.log"
-rg -q "issuing Fiber settlement intent" "$run_dir/server.log"
-rg -q "settlement acknowledgement" "$run_dir/server.log"
+rg -q "releasing Fiber hold-invoice preimage" "$run_dir/server.log"
+rg -q "stage=Settled" "$run_dir/server.log"
 rg -q "match ended" "$run_dir/server.log"
 rg -q "adapter:" "$run_dir/alice.log"
-rg -q "payment #[0-9]+ completed: Success" "$run_dir/alice.log" "$run_dir/bob.log"
+rg -q "joined bound match" "$run_dir/alice.log" "$run_dir/bob.log"
 
 echo "Secure desktop smoke test passed. Logs: $run_dir"

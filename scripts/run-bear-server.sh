@@ -9,6 +9,10 @@ port="${PORT:-5000}"
 bind_addr="${BIND_ADDR:-0.0.0.0}"
 public_addr="${PUBLIC_ADDR:-}"
 players_text="${PLAYERS:-alice bob}"
+player_a_fiber_pubkey="${PLAYER_A_FIBER_PUBKEY:-0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798}"
+player_b_fiber_pubkey="${PLAYER_B_FIBER_PUBKEY:-02c6047f9441ed7d6d3045406e95c07cd85a778e4b8cef3ca7abac09b95c709ee5}"
+mock_player_a_fiber_pubkey="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+mock_player_b_fiber_pubkey="02c6047f9441ed7d6d3045406e95c07cd85a778e4b8cef3ca7abac09b95c709ee5"
 expire_seconds="${EXPIRE_SECONDS:-3600}"
 tmux_session="${TMUX_SESSION:-ai}"
 tmux_window="${TMUX_WINDOW:-openstrike-arena}"
@@ -38,6 +42,8 @@ Options:
   --port PORT             UDP game port, default: 5000
   --public-addr ADDR      Reachable IP:port for client tokens
   --players "A B"         Space-separated player names, default: "alice bob"
+  --player-a-fiber-pubkey PUBKEY  Bind slot A token to this FNN v0.9.0-rc7 pubkey
+  --player-b-fiber-pubkey PUBKEY  Bind slot B token to this FNN v0.9.0-rc7 pubkey
   --expire-seconds SEC    Connect token TTL, default: 3600
   --rust-log FILTER       Remote arena-server log filter, default: info
   --map PATH              Sync and run a GoldSrc BSP instead of --dev-arena
@@ -47,7 +53,8 @@ Options:
   -h, --help              Show this help
 
 Environment variables with the same uppercase names are also supported:
-BEAR_HOST, REMOTE_DIR, PORT, PUBLIC_ADDR, PLAYERS, EXPIRE_SECONDS,
+BEAR_HOST, REMOTE_DIR, PORT, PUBLIC_ADDR, PLAYERS, PLAYER_A_FIBER_PUBKEY,
+PLAYER_B_FIBER_PUBKEY, EXPIRE_SECONDS,
 TMUX_SESSION, TMUX_WINDOW, BUILD_PROFILE, RESTART, ARENA_RUST_LOG, LOCAL_STATE_DIR,
 MAP_PATH, WAD_DIR,
 CARGO_HTTP_TIMEOUT, CARGO_NET_RETRY, CARGO_REGISTRIES_CRATES_IO_PROTOCOL.
@@ -74,6 +81,14 @@ while [ "$#" -gt 0 ]; do
       ;;
     --players)
       players_text="$2"
+      shift 2
+      ;;
+    --player-a-fiber-pubkey)
+      player_a_fiber_pubkey="$2"
+      shift 2
+      ;;
+    --player-b-fiber-pubkey)
+      player_b_fiber_pubkey="$2"
       shift 2
       ;;
     --expire-seconds)
@@ -136,6 +151,8 @@ sq() {
 }
 
 remote_bash() {
+  # The command is intentionally quoted on the client before SSH sends it.
+  # shellcheck disable=SC2029
   ssh "$bear_host" "bash -lc $(sq "$1")"
 }
 
@@ -161,7 +178,7 @@ if [ -n "$map_path" ]; then
       echo "WAD directory not found: ${wad_dirs[$i]}" >&2
       exit 1
     fi
-    wad_dirs[$i]="$(cd "${wad_dirs[$i]}" && pwd)"
+    wad_dirs[i]="$(cd "${wad_dirs[i]}" && pwd)"
   done
 elif [ "${#wad_dirs[@]}" -gt 0 ]; then
   echo "--wad-dir requires --map" >&2
@@ -169,8 +186,8 @@ elif [ "${#wad_dirs[@]}" -gt 0 ]; then
 fi
 
 IFS=' ' read -r -a players <<<"$players_text"
-if [ "${#players[@]}" -eq 0 ]; then
-  echo "at least one player name is required" >&2
+if [ "${#players[@]}" -ne 2 ]; then
+  echo "exactly two player names are required for the 1v1 server" >&2
   exit 2
 fi
 for player in "${players[@]}"; do
@@ -217,6 +234,11 @@ mkdir -p "$local_token_dir"
 echo "Deploying to $bear_host:$remote_dir"
 echo "Public game address: $public_addr"
 echo "Players: ${players[*]}"
+echo "Slot A Fiber pubkey: $player_a_fiber_pubkey"
+echo "Slot B Fiber pubkey: $player_b_fiber_pubkey"
+if [ "$player_a_fiber_pubkey" = "$mock_player_a_fiber_pubkey" ] || [ "$player_b_fiber_pubkey" = "$mock_player_b_fiber_pubkey" ]; then
+  echo "Warning: at least one token uses a deterministic mock Fiber pubkey; pass both real FNN node_info.pubkey values before funded play." >&2
+fi
 if [ -n "$map_path" ]; then
   echo "Map: $map_path"
 fi
@@ -269,7 +291,15 @@ fi
 rm -f run/tokens/*.token
 "
 
-for player in "${players[@]}"; do
+for i in "${!players[@]}"; do
+  player="${players[$i]}"
+  if [ "$i" -eq 0 ]; then
+    slot="a"
+    fiber_pubkey="$player_a_fiber_pubkey"
+  else
+    slot="b"
+    fiber_pubkey="$player_b_fiber_pubkey"
+  fi
   remote_bash "
 set -euo pipefail
 cd $(sq "$remote_dir")
@@ -277,6 +307,8 @@ cd $(sq "$remote_dir")
   --netcode-key secrets/netcode.key \
   --server $(sq "$public_addr") \
   --name $(sq "$player") \
+  --slot $(sq "$slot") \
+  --fiber-pubkey $(sq "$fiber_pubkey") \
   --output $(sq "run/tokens/$player.token") \
   --expire-seconds $(sq "$expire_seconds")
 "
