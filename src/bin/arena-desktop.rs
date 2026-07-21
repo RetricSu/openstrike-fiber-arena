@@ -224,6 +224,17 @@ struct ShotEffect {
     b: Vec3,
 }
 
+enum FiberWorkerEvent {
+    Message(ClientMessage),
+    SetupReady {
+        fnn_version: String,
+        channel_id: String,
+        outbound: u128,
+        invoices: Vec<(HoldInvoiceTerm, String)>,
+    },
+    SetupFailed(String),
+}
+
 impl RemoteTrack {
     fn update(&mut self, snapshot: PlayerSnapshot) {
         self.previous = self.current.or(Some(snapshot));
@@ -288,8 +299,8 @@ struct DesktopGame {
     fiber: Option<FiberRpcClient>,
     fiber_currency: FiberCurrency,
     payment_runtime: Option<tokio::runtime::Runtime>,
-    payment_tx: mpsc::Sender<ClientMessage>,
-    payment_rx: mpsc::Receiver<ClientMessage>,
+    payment_tx: mpsc::Sender<FiberWorkerEvent>,
+    payment_rx: mpsc::Receiver<FiberWorkerEvent>,
     pending_operations: usize,
     match_end_received: bool,
     exit_on_end: bool,
@@ -458,7 +469,11 @@ impl DesktopGame {
                 }
                 self.slot = Some(slot);
                 self.guard = Some(SettlementGuard::new(terms));
-                self.status = format!("LOCKING HOLDS AS {slot:?}");
+                self.status = if self.mock_payments {
+                    format!("LOCKING HOLDS AS {slot:?}")
+                } else {
+                    "CHECKING FIBER CHANNEL".into()
+                };
                 self.send_control(ClientMessage::AcceptTerms { match_id });
                 log::info!("joined bound match {match_id} as {slot:?}");
             }
@@ -532,66 +547,81 @@ impl DesktopGame {
             .filter(|term| term.payee == slot)
             .cloned()
             .collect();
-        let created = self
+        let terms = terms.clone();
+        let tx = self.payment_tx.clone();
+        self.pending_operations += 1;
+        self.status = "CHECKING FIBER CHANNEL".into();
+        handle.spawn(async move {
+            let created: std::result::Result<_, openstrike_fiber_arena::fiber::FiberError> =
+                async {
+                    let readiness = rpc
+                        .check_direct_channel(&opponent_pubkey, terms.max_total_per_player)
+                        .await?;
+                    if readiness.node.pubkey != local_pubkey {
+                        return Err(openstrike_fiber_arena::fiber::FiberError::InvoiceMismatch(
+                            format!(
+                                "local FNN pubkey {} differs from connect-token binding {}",
+                                readiness.node.pubkey, local_pubkey
+                            ),
+                        ));
+                    }
+                    let mut invoices = Vec::with_capacity(payee_terms.len());
+                    for term in payee_terms {
+                        let expectation =
+                            HoldInvoiceExpectation::new(&terms, &term, &local_pubkey, currency)?;
+                        let invoice = rpc.create_hold_invoice(&expectation).await?;
+                        invoices.push((term, invoice));
+                    }
+                    Ok((readiness, invoices))
+                }
+                .await;
+            let event = match created {
+                Ok((readiness, invoices)) => FiberWorkerEvent::SetupReady {
+                    fnn_version: readiness.node.version,
+                    channel_id: readiness.channel.channel_id,
+                    outbound: readiness.channel.local_balance,
+                    invoices,
+                },
+                Err(error) => FiberWorkerEvent::SetupFailed(error.to_string()),
+            };
+            tx.send(event).ok();
+        });
+        Ok(())
+    }
+
+    fn wait_for_invoice_received(&mut self, term: HoldInvoiceTerm) -> Result<()> {
+        let rpc = self.fiber.clone().context("Fiber RPC unavailable")?;
+        let handle = self
             .payment_runtime
             .as_ref()
-            .expect("validated Fiber runtime")
-            .block_on(async {
-                let readiness = rpc
-                    .check_direct_channel(&opponent_pubkey, terms.max_total_per_player)
-                    .await?;
-                if readiness.node.pubkey != local_pubkey {
-                    return Err(openstrike_fiber_arena::fiber::FiberError::InvoiceMismatch(
-                        format!(
-                            "local FNN pubkey {} differs from connect-token binding {}",
-                            readiness.node.pubkey, local_pubkey
-                        ),
-                    ));
-                }
-                let mut invoices = Vec::with_capacity(payee_terms.len());
-                for term in payee_terms {
-                    let expectation =
-                        HoldInvoiceExpectation::new(terms, &term, &local_pubkey, currency)?;
-                    let invoice = rpc.create_hold_invoice(&expectation).await?;
-                    invoices.push((term, invoice));
-                }
-                Ok::<_, openstrike_fiber_arena::fiber::FiberError>((readiness, invoices))
-            })?;
-        log::info!(
-            "bound Fiber channel ready: FNN {} channel {} outbound {}",
-            created.0.node.version,
-            created.0.channel.channel_id,
-            created.0.channel.local_balance
-        );
-        for (term, invoice) in created.1 {
-            self.send_control(ClientMessage::HoldInvoiceOffer(HoldInvoiceOffer {
-                match_id: terms.match_id,
-                reservation_id: term.reservation_id,
-                payment_hash: term.payment_hash,
-                invoice,
-            }));
-            self.pending_operations += 1;
-            let rpc = rpc.clone();
-            let tx = self.payment_tx.clone();
-            let match_id = terms.match_id;
-            let timeout = Duration::from_millis(terms.payment_deadline_ms);
-            handle.spawn(async move {
-                let message = match rpc.wait_invoice_received(term.payment_hash, timeout).await {
-                    Ok(()) => ClientMessage::HoldInvoiceAck(hold_ack(
-                        match_id,
-                        &term,
-                        HoldInvoiceStage::Received,
-                    )),
-                    Err(error) => ClientMessage::HoldInvoiceFailure(hold_failure(
-                        match_id,
-                        &term,
-                        HoldInvoiceStage::Received,
-                        error.to_string(),
-                    )),
-                };
-                tx.send(message).ok();
-            });
-        }
+            .context("Fiber runtime unavailable")?
+            .handle()
+            .clone();
+        let terms = self
+            .guard
+            .as_ref()
+            .context("settlement terms unavailable")?
+            .terms();
+        let match_id = terms.match_id;
+        let timeout = Duration::from_millis(terms.payment_deadline_ms);
+        let tx = self.payment_tx.clone();
+        self.pending_operations += 1;
+        handle.spawn(async move {
+            let message = match rpc.wait_invoice_received(term.payment_hash, timeout).await {
+                Ok(()) => ClientMessage::HoldInvoiceAck(hold_ack(
+                    match_id,
+                    &term,
+                    HoldInvoiceStage::Received,
+                )),
+                Err(error) => ClientMessage::HoldInvoiceFailure(hold_failure(
+                    match_id,
+                    &term,
+                    HoldInvoiceStage::Received,
+                    error.to_string(),
+                )),
+            };
+            tx.send(FiberWorkerEvent::Message(message)).ok();
+        });
         Ok(())
     }
 
@@ -691,7 +721,7 @@ impl DesktopGame {
                     error.to_string(),
                 )),
             };
-            tx.send(message).ok();
+            tx.send(FiberWorkerEvent::Message(message)).ok();
         });
     }
 
@@ -768,7 +798,7 @@ impl DesktopGame {
                     error.to_string(),
                 )),
             };
-            tx.send(message).ok();
+            tx.send(FiberWorkerEvent::Message(message)).ok();
         });
     }
 
@@ -838,38 +868,93 @@ impl DesktopGame {
                     error.to_string(),
                 )),
             };
-            tx.send(message).ok();
+            tx.send(FiberWorkerEvent::Message(message)).ok();
         });
     }
 
     fn drain_fiber_results(&mut self) {
-        while let Ok(message) = self.payment_rx.try_recv() {
+        while let Ok(event) = self.payment_rx.try_recv() {
             self.pending_operations = self.pending_operations.saturating_sub(1);
-            match &message {
-                ClientMessage::HoldInvoiceAck(ack) => {
+            match event {
+                FiberWorkerEvent::Message(message) => {
+                    match &message {
+                        ClientMessage::HoldInvoiceAck(ack) => {
+                            log::info!(
+                                "hold #{} completed stage {:?}",
+                                ack.reservation_id,
+                                ack.stage
+                            );
+                            self.status = if self.running {
+                                "LIVE — FIBER SETTLED".into()
+                            } else {
+                                "PREPARING FIBER HOLDS".into()
+                            };
+                        }
+                        ClientMessage::HoldInvoiceFailure(failure) => {
+                            log::warn!(
+                                "hold #{} {:?} failed: {}",
+                                failure.reservation_id,
+                                failure.stage,
+                                failure.error
+                            );
+                            self.status = "FIBER HOLD FAILED".into();
+                        }
+                        _ => {}
+                    }
+                    self.send_control(message);
+                }
+                FiberWorkerEvent::SetupReady {
+                    fnn_version,
+                    channel_id,
+                    outbound,
+                    invoices,
+                } => {
                     log::info!(
-                        "hold #{} completed stage {:?}",
-                        ack.reservation_id,
-                        ack.stage
+                        "bound Fiber channel ready: FNN {fnn_version} channel {channel_id} outbound {outbound}"
                     );
-                    self.status = if self.running {
-                        "LIVE — FIBER SETTLED".into()
-                    } else {
-                        "PREPARING FIBER HOLDS".into()
+                    self.status = "PREPARING FIBER HOLDS".into();
+                    let Some(match_id) = self.guard.as_ref().map(|guard| guard.terms().match_id)
+                    else {
+                        self.fail("settlement terms unavailable after Fiber setup".into());
+                        continue;
                     };
+                    for (term, invoice) in invoices {
+                        self.send_control(ClientMessage::HoldInvoiceOffer(HoldInvoiceOffer {
+                            match_id,
+                            reservation_id: term.reservation_id,
+                            payment_hash: term.payment_hash,
+                            invoice,
+                        }));
+                        if let Err(error) = self.wait_for_invoice_received(term) {
+                            self.fail(format!("waiting for Fiber hold invoice failed: {error:#}"));
+                            break;
+                        }
+                    }
                 }
-                ClientMessage::HoldInvoiceFailure(failure) => {
-                    log::warn!(
-                        "hold #{} {:?} failed: {}",
-                        failure.reservation_id,
-                        failure.stage,
-                        failure.error
-                    );
-                    self.status = "FIBER HOLD FAILED".into();
+                FiberWorkerEvent::SetupFailed(error) => {
+                    let failure = self.slot.and_then(|slot| {
+                        self.guard.as_ref().and_then(|guard| {
+                            let terms = guard.terms();
+                            terms
+                                .hold_invoices
+                                .iter()
+                                .find(|term| term.payee == slot)
+                                .map(|term| {
+                                    ClientMessage::HoldInvoiceFailure(hold_failure(
+                                        terms.match_id,
+                                        term,
+                                        HoldInvoiceStage::Received,
+                                        error.clone(),
+                                    ))
+                                })
+                        })
+                    });
+                    if let Some(failure) = failure {
+                        self.send_control(failure);
+                    }
+                    self.fail(format!("Fiber hold-invoice setup failed: {error}"));
                 }
-                _ => {}
             }
-            self.send_control(message);
         }
     }
 

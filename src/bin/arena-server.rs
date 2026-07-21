@@ -266,19 +266,28 @@ fn main() -> Result<()> {
                             ) {
                                 Ok(releases) => {
                                     for release in releases {
+                                        let payee = release.intent.body.payee;
+                                        let reservation_id = release.intent.body.reservation_id;
                                         info!(
                                             sequence = release.intent.body.sequence,
-                                            reservation_id = release.intent.body.reservation_id,
-                                            ?release.intent.body.payee,
+                                            reservation_id,
+                                            ?payee,
                                             amount = %release.intent.body.amount,
                                             "releasing Fiber hold-invoice preimage"
                                         );
-                                        send_reliable_to_slot(
+                                        if let Err(error) = send_reliable_to_slot(
                                             &mut network,
                                             &clients,
-                                            release.intent.body.payee,
+                                            payee,
                                             &ServerMessage::HoldInvoiceRelease(release),
-                                        )?;
+                                        ) {
+                                            warn!(
+                                                %error,
+                                                ?payee,
+                                                reservation_id,
+                                                "could not deliver Fiber hold-invoice preimage"
+                                            );
+                                        }
                                     }
                                 }
                                 Err(error) => {
@@ -293,7 +302,7 @@ fn main() -> Result<()> {
                                 .as_mut()
                                 .expect("a live match has a settlement coordinator");
                             for term in coordinator.cancel_unused() {
-                                send_reliable_to_slot(
+                                if let Err(error) = send_reliable_to_slot(
                                     &mut network,
                                     &clients,
                                     term.payee,
@@ -302,7 +311,14 @@ fn main() -> Result<()> {
                                         reservation_id: term.reservation_id,
                                         payment_hash: term.payment_hash,
                                     },
-                                )?;
+                                ) {
+                                    warn!(
+                                        %error,
+                                        ?term.payee,
+                                        reservation_id = term.reservation_id,
+                                        "could not deliver Fiber hold-invoice cancellation"
+                                    );
+                                }
                             }
                             broadcast_reliable(
                                 &mut network,

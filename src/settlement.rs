@@ -84,9 +84,12 @@ impl SettlementCoordinator {
             amount_per_damage_bucket > 0,
             "payment per bucket must be non-zero"
         );
+        // Use the arithmetic form so this stays compatible with Rust versions
+        // that predate the integer `is_multiple_of` method.
+        #[allow(clippy::manual_is_multiple_of)]
+        let cap_is_aligned = max_total_per_player % amount_per_damage_bucket == 0;
         assert!(
-            max_total_per_player >= amount_per_damage_bucket
-                && max_total_per_player.is_multiple_of(amount_per_damage_bucket),
+            max_total_per_player >= amount_per_damage_bucket && cap_is_aligned,
             "match cap must be a positive multiple of the per-bucket amount"
         );
         let reservations_per_player = max_total_per_player / amount_per_damage_bucket;
