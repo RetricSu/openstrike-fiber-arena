@@ -1,5 +1,9 @@
 pub mod client;
+#[cfg(feature = "openstrike")]
+pub mod devmap;
 pub mod fiber;
+#[cfg(feature = "desktop")]
+pub mod neon;
 pub mod net;
 #[cfg(feature = "openstrike")]
 pub mod openstrike;

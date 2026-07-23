@@ -14,7 +14,7 @@ use pocket3d_bsp::{Hull, MapCollision, MapData, SpawnPoint};
 use serde::Serialize;
 
 use crate::{
-    TICK_HZ,
+    TICK_HZ, devmap,
     protocol::{InputFrame, MatchPhase, PlayerSlot, PlayerSnapshot, WorldSnapshot},
     sim::{MatchEvent, MatchSimulation},
 };
@@ -95,23 +95,11 @@ impl OpenStrikeDuelSim {
         Ok((Self::new(collision, [a, b]), map))
     }
 
-    /// Asset-free arena used by CI and first-run desktop smoke tests. The
-    /// visible floor is created by the client; gravity is disabled because
-    /// this collision world intentionally contains no copyrighted BSP data.
+    /// Asset-free neon arena used by CI and first-run desktop smoke tests.
+    /// Layout, movement collision, and hitscan occlusion come from
+    /// [`devmap`]; gravity is disabled because the floor is perfectly flat.
     pub fn dev_arena() -> Self {
-        let mut simulation = Self::new(
-            empty_collision(),
-            [
-                SpawnPoint {
-                    pos: Vec3::new(0.0, 0.0, 100.0),
-                    yaw: 0.0,
-                },
-                SpawnPoint {
-                    pos: Vec3::new(0.0, 0.0, -100.0),
-                    yaw: std::f32::consts::PI,
-                },
-            ],
-        );
+        let mut simulation = Self::new(empty_collision(), devmap::spawns());
         simulation.dev_arena = true;
         for player in &mut simulation.players {
             player.player.params.gravity = 0.0;
@@ -142,7 +130,7 @@ impl OpenStrikeDuelSim {
         let mut wish = duelist.player.forward_flat() * input.move_y;
         wish += duelist.player.right() * input.move_x;
         if self.dev_arena {
-            flat_dev_arena_step(&mut duelist.player, wish, input.walk);
+            devmap::flat_step(&mut duelist.player, wish, input.walk, DT);
             return;
         }
         let movement = pocket3d_bsp::collide::MoveInput {
@@ -178,12 +166,16 @@ impl OpenStrikeDuelSim {
         let shooter = &self.players[attacker.index()].player;
         let eye = shooter.eye();
         let direction = shooter.view_dir();
-        let world_hit = self.collision.trace(
-            Hull::Point,
-            eye,
-            eye + direction * openstrike_core::weapon::RANGE,
-        );
-        let max_distance = world_hit.fraction * openstrike_core::weapon::RANGE;
+        let max_distance = if self.dev_arena {
+            devmap::trace_distance(eye, direction, openstrike_core::weapon::RANGE)
+        } else {
+            let world_hit = self.collision.trace(
+                Hull::Point,
+                eye,
+                eye + direction * openstrike_core::weapon::RANGE,
+            );
+            world_hit.fraction * openstrike_core::weapon::RANGE
+        };
         let target_center = self.players[victim.index()].player.state.pos;
         let Some(hit_distance) = openstrike_core::sim::ray_aabb(
             eye,
@@ -237,21 +229,6 @@ impl OpenStrikeDuelSim {
         self.players[PlayerSlot::A.index()].player.state.pos += push;
         self.players[PlayerSlot::B.index()].player.state.pos -= push;
     }
-}
-
-fn flat_dev_arena_step(player: &mut Player, wish: Vec3, walk: bool) {
-    let speed_scale = if walk {
-        openstrike_core::sim::WALK_SPEED_SCALE
-    } else {
-        1.0
-    };
-    let velocity = wish.normalize_or_zero() * player.params.max_speed * speed_scale;
-    player.state.vel = Vec3::new(velocity.x, 0.0, velocity.z);
-    player.state.pos += player.state.vel * DT;
-    player.state.pos.x = player.state.pos.x.clamp(-460.0, 460.0);
-    player.state.pos.y = 0.0;
-    player.state.pos.z = player.state.pos.z.clamp(-460.0, 460.0);
-    player.state.on_ground = true;
 }
 
 impl MatchSimulation for OpenStrikeDuelSim {
@@ -404,6 +381,10 @@ mod tests {
     #[test]
     fn simultaneous_body_shots_are_symmetric() {
         let mut duel = OpenStrikeDuelSim::dev_arena();
+        // The dev arena's monolith blocks the spawn-to-spawn sightline by
+        // design, so place both duelists in the open mid-lane for this test.
+        duel.players[PlayerSlot::A.index()].player.state.pos = Vec3::new(120.0, 0.0, 100.0);
+        duel.players[PlayerSlot::B.index()].player.state.pos = Vec3::new(120.0, 0.0, -100.0);
         duel.set_phase(MatchPhase::Live);
         let events = duel.tick([
             InputFrame {
