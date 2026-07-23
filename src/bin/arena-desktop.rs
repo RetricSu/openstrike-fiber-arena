@@ -12,7 +12,9 @@ use openstrike_core::Player;
 use openstrike_fiber_arena::{
     TICK_HZ,
     client::SettlementGuard,
+    devmap,
     fiber::{FiberCurrency, FiberRpcClient, HoldInvoiceExpectation},
+    neon,
     net::{unix_ms, unix_time},
     protocol::{
         ClientMessage, HoldInvoiceAck, HoldInvoiceFailure, HoldInvoiceOffer, HoldInvoiceRelease,
@@ -25,7 +27,7 @@ use pocket3d::{
     app::{AppConfig, Game, run},
     bsp::{Hull, MapCollision, MapData},
     input::Input,
-    model::{ModelAsset, ModelVertex},
+    model::ModelAsset,
     prelude::*,
     winit::{event::MouseButton, keyboard::KeyCode},
 };
@@ -88,7 +90,7 @@ fn main() -> Result<()> {
             pocket3d::bsp::load_map(path, &args.wad_dirs)
                 .with_context(|| format!("loading map {}", path.display()))?
         }
-        None => development_map(),
+        None => neon::development_map(),
     };
     let spawn = map
         .ct_spawns
@@ -97,8 +99,7 @@ fn main() -> Result<()> {
         .copied()
         .context("map has no player spawn")?;
     let soldier_model = args.soldier_model.clone().unwrap_or_else(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("vendor/open-strike/assets/models/Soldier.glb")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/models/duelist.glb")
     });
     let title = format!("OpenStrike Fiber Arena — {}", args.name);
     let game = DesktopGame::connect(&args, map, spawn.pos, spawn.yaw, soldier_model)?;
@@ -173,7 +174,7 @@ fn predict_step(player: &mut Player, collision: &MapCollision, input: InputFrame
     player.pitch = input.pitch;
     let wish = player.forward_flat() * input.move_y + player.right() * input.move_x;
     if dev_arena {
-        flat_dev_arena_step(player, wish, input.walk);
+        devmap::flat_step(player, wish, input.walk, DT);
         return;
     }
     pocket3d::collide::step_character(
@@ -194,21 +195,6 @@ fn predict_step(player: &mut Player, collision: &MapCollision, input: InputFrame
     );
 }
 
-fn flat_dev_arena_step(player: &mut Player, wish: Vec3, walk: bool) {
-    let speed_scale = if walk {
-        openstrike_core::sim::WALK_SPEED_SCALE
-    } else {
-        1.0
-    };
-    let velocity = wish.normalize_or_zero() * player.params.max_speed * speed_scale;
-    player.state.vel = Vec3::new(velocity.x, 0.0, velocity.z);
-    player.state.pos += player.state.vel * DT;
-    player.state.pos.x = player.state.pos.x.clamp(-460.0, 460.0);
-    player.state.pos.y = 0.0;
-    player.state.pos.z = player.state.pos.z.clamp(-460.0, 460.0);
-    player.state.on_ground = true;
-}
-
 #[derive(Default)]
 struct RemoteTrack {
     previous: Option<PlayerSnapshot>,
@@ -222,6 +208,14 @@ struct ShotEffect {
     ttl: f32,
     a: Vec3,
     b: Vec3,
+    color: [f32; 4],
+}
+
+struct Floater {
+    text: String,
+    age: f32,
+    ttl: f32,
+    color: [f32; 4],
 }
 
 enum FiberWorkerEvent {
@@ -241,13 +235,30 @@ impl RemoteTrack {
         self.current = Some(snapshot);
     }
 
-    fn advance_animation(&mut self, dt: f32, idle_clip: usize, walk_clip: usize, run_clip: usize) {
+    fn advance_animation(
+        &mut self,
+        dt: f32,
+        idle_clip: usize,
+        walk_clip: usize,
+        run_clip: usize,
+        death_clip: Option<usize>,
+    ) {
         let Some(player) = self.current else {
             return;
         };
         if !player.alive {
-            self.animation_clip = Some(idle_clip);
-            self.animation_time = 0.0;
+            if let Some(death) = death_clip {
+                if self.animation_clip != Some(death) {
+                    self.animation_clip = Some(death);
+                    self.animation_time = 0.0;
+                } else {
+                    // Non-looping: the skeleton sampler clamps at the last key.
+                    self.animation_time += dt;
+                }
+            } else {
+                self.animation_clip = Some(idle_clip);
+                self.animation_time = 0.0;
+            }
             return;
         }
 
@@ -281,6 +292,7 @@ struct DesktopGame {
     idle_clip: usize,
     walk_clip: usize,
     run_clip: usize,
+    death_clip: Option<usize>,
     predictor: Predictor,
     remote: RemoteTrack,
     local_snapshot: Option<PlayerSnapshot>,
@@ -309,6 +321,16 @@ struct DesktopGame {
     local_recoil: f32,
     shot_effects: Vec<ShotEffect>,
     fatal_error: Option<String>,
+    // Neon presentation state.
+    sway: Vec2,
+    sway_input: Vec2,
+    bob_phase: f32,
+    bob_amount: f32,
+    reload_left: f32,
+    hit_marker: f32,
+    damage_flash: f32,
+    fight_banner: f32,
+    floaters: Vec<Floater>,
 }
 
 impl DesktopGame {
@@ -356,6 +378,7 @@ impl DesktopGame {
             idle_clip: 0,
             walk_clip: 0,
             run_clip: 0,
+            death_clip: None,
             predictor,
             remote: RemoteTrack::default(),
             local_snapshot: None,
@@ -384,6 +407,15 @@ impl DesktopGame {
             local_recoil: 0.0,
             shot_effects: Vec::new(),
             fatal_error: None,
+            sway: Vec2::ZERO,
+            sway_input: Vec2::ZERO,
+            bob_phase: 0.0,
+            bob_amount: 0.0,
+            reload_left: 0.0,
+            hit_marker: 0.0,
+            damage_flash: 0.0,
+            fight_banner: 0.0,
+            floaters: Vec::new(),
         })
     }
 
@@ -626,7 +658,11 @@ impl DesktopGame {
     }
 
     fn apply_snapshot(&mut self, snapshot: openstrike_fiber_arena::protocol::WorldSnapshot) {
+        let previous_phase = self.phase;
         self.phase = snapshot.phase;
+        if previous_phase != MatchPhase::Live && self.phase == MatchPhase::Live {
+            self.fight_banner = 1.5;
+        }
         let Some(slot) = self.slot else {
             return;
         };
@@ -636,9 +672,59 @@ impl DesktopGame {
             self.view_yaw = local.yaw;
             self.view_pitch = if self.auto_fire { -0.05 } else { local.pitch };
         }
+
+        // Presentation deltas, derived from consecutive snapshots.
+        if let Some(previous) = self.local_snapshot
+            && local.health < previous.health
+        {
+            self.damage_flash = 0.45;
+        }
+        if let Some(previous) = self.remote.current {
+            if remote.health < previous.health {
+                self.hit_marker = if remote.alive { 0.18 } else { 0.4 };
+            }
+            if remote.ammo < previous.ammo && remote.alive {
+                self.spawn_remote_shot_effect(remote);
+            }
+        }
+        if let Some(previous) = self.local_snapshot
+            && !previous.reloading
+            && local.reloading
+        {
+            self.reload_left = openstrike_core::weapon::WeaponConfig::default().reload_time;
+        }
+
         self.predictor.reconcile(local, &self.map.collision);
         self.local_snapshot = Some(local);
         self.remote.update(remote);
+    }
+
+    fn spawn_remote_shot_effect(&mut self, remote: PlayerSnapshot) {
+        let eye = Vec3::from(remote.position) + Vec3::Y * 28.0;
+        let dir = view_direction(remote.yaw, remote.pitch);
+        let right = Vec3::new(remote.yaw.cos(), 0.0, -remote.yaw.sin());
+        let muzzle = eye + dir * 14.0 + right * 3.0 - Vec3::Y * 3.5;
+        let range = self.trace_visual(eye, dir, 900.0);
+        self.shot_effects.push(ShotEffect {
+            age: 0.0,
+            ttl: 0.09,
+            a: muzzle,
+            b: eye + dir * range,
+            color: neon::team_color(remote.slot),
+        });
+    }
+
+    /// World-hit distance for tracer endpoints: shared dev-arena collision,
+    /// or the BSP collision world on real maps.
+    fn trace_visual(&self, origin: Vec3, dir: Vec3, max: f32) -> f32 {
+        if self.dev_arena {
+            return devmap::trace_distance(origin, dir, max);
+        }
+        let trace = self
+            .map
+            .collision
+            .trace(Hull::Point, origin, origin + dir * max);
+        trace.fraction * max
     }
 
     fn handle_invoice_offer(&mut self, offer: HoldInvoiceOffer) {
@@ -884,8 +970,28 @@ impl DesktopGame {
                                 ack.reservation_id,
                                 ack.stage
                             );
+                            if ack.stage == HoldInvoiceStage::Settled
+                                && let Some(guard) = &self.guard
+                                && let Some(term) = guard
+                                    .terms()
+                                    .hold_invoices
+                                    .iter()
+                                    .find(|term| term.reservation_id == ack.reservation_id)
+                            {
+                                let direction = if Some(term.payee) == self.slot {
+                                    "+"
+                                } else {
+                                    "-"
+                                };
+                                self.floaters.push(Floater {
+                                    text: format!("FIBER {direction}{} SHANNON", term.amount),
+                                    age: 0.0,
+                                    ttl: 1.6,
+                                    color: [0.55, 1.0, 0.7, 1.0],
+                                });
+                            }
                             self.status = if self.running {
-                                "LIVE — FIBER SETTLED".into()
+                                "LIVE - FIBER SETTLED".into()
                             } else {
                                 "PREPARING FIBER HOLDS".into()
                             };
@@ -985,26 +1091,27 @@ impl DesktopGame {
     fn spawn_local_shot_effect(&mut self) {
         let eye = self.predictor.player.eye();
         let dir = view_direction(self.view_yaw, self.view_pitch);
-        let muzzle = viewmodel_transform(eye, self.view_yaw, self.view_pitch, self.local_recoil)
-            .transform_point3(openstrike_core::weapon::MUZZLE_LOCAL);
-        let trace =
-            self.map
-                .collision
-                .trace(Hull::Point, eye, eye + dir * openstrike_core::weapon::RANGE);
-        let end = if trace.fraction < 1.0 {
-            trace.end
-        } else {
-            eye + dir * 900.0
-        };
+        let muzzle = viewmodel_transform(
+            eye,
+            self.view_yaw,
+            self.view_pitch,
+            self.local_recoil,
+            0.0,
+            Vec2::ZERO,
+            Vec2::ZERO,
+        )
+        .transform_point3(openstrike_core::weapon::MUZZLE_LOCAL);
+        let range = self.trace_visual(eye, dir, 900.0);
+        let color = self.slot.map(neon::team_color).unwrap_or(neon::TEAM_A);
         self.shot_effects.push(ShotEffect {
             age: 0.0,
             ttl: 0.08,
             a: muzzle,
-            b: end,
+            b: eye + dir * range,
+            color,
         });
         self.local_fire_cooldown = LOCAL_FIRE_INTERVAL;
         self.local_recoil = (self.local_recoil + 0.55).min(1.0);
-        self.status = "LIVE - FIRING".into();
     }
 
     fn tick_visual_effects(&mut self, dt: f32) {
@@ -1014,6 +1121,28 @@ impl DesktopGame {
             effect.age += dt;
         }
         self.shot_effects.retain(|effect| effect.age < effect.ttl);
+
+        self.hit_marker = (self.hit_marker - dt).max(0.0);
+        self.damage_flash = (self.damage_flash - dt).max(0.0);
+        self.fight_banner = (self.fight_banner - dt).max(0.0);
+        self.reload_left = (self.reload_left - dt).max(0.0);
+        for floater in &mut self.floaters {
+            floater.age += dt;
+        }
+        self.floaters.retain(|floater| floater.age < floater.ttl);
+
+        // View-model sway (lags the view) and walk bob (driven by speed).
+        let target_sway = Vec2::new(self.sway_input.x, self.sway_input.y).clamp_length_max(1.4);
+        self.sway = self.sway.lerp(target_sway, (dt * 10.0).min(1.0));
+        self.sway_input = Vec2::ZERO;
+        let speed = Vec3::new(
+            self.predictor.player.state.vel.x,
+            0.0,
+            self.predictor.player.state.vel.z,
+        )
+        .length();
+        self.bob_phase += dt * (4.0 + speed * 0.055);
+        self.bob_amount = speed / 250.0;
     }
 
     fn compose_scene(&mut self, alpha: f32, time: f32, size: (u32, u32)) {
@@ -1028,44 +1157,65 @@ impl DesktopGame {
             let position = Vec3::from(previous.position)
                 .lerp(Vec3::from(current.position), alpha.clamp(0.0, 1.0));
             let yaw = lerp_angle(previous.yaw, current.yaw, alpha);
+            let team = neon::team_color(current.slot);
             let mut model = ModelInstance::new(asset.clone());
             let scale = PLAYER_MODEL_HEIGHT / asset.height();
-            let fall = if current.alive { 0.0 } else { 1.0 };
-            model.transform =
-                Mat4::from_translation(position - Vec3::Y * 36.0 - Vec3::Y * fall * 2.0)
-                    * Mat4::from_rotation_y(yaw)
-                    * Mat4::from_rotation_x(-fall * std::f32::consts::FRAC_PI_2 * 0.94)
-                    * Mat4::from_scale(Vec3::splat(scale));
+            let base =
+                Mat4::from_translation(position - Vec3::Y * 36.0) * Mat4::from_rotation_y(yaw);
+            model.transform = if current.alive || self.death_clip.is_some() {
+                // The Death clip lays the body down itself when present.
+                base * Mat4::from_scale(Vec3::splat(scale))
+            } else {
+                base * Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2 * 0.94)
+                    * Mat4::from_scale(Vec3::splat(scale))
+            };
             model.anim = AnimState {
                 clip: self.remote.animation_clip.unwrap_or(self.idle_clip),
                 time: self.remote.animation_time,
                 speed: 1.0,
-                looping: true,
+                looping: current.alive,
             };
             model.tint = if current.alive {
-                [1.0; 4]
+                team
             } else {
-                [0.5, 0.42, 0.4, 1.0]
+                [team[0] * 0.4, team[1] * 0.4, team[2] * 0.4, 1.0]
             };
             self.scene.models.push(model);
             if current.alive
                 && let Some(rifle) = &self.rifle_asset
             {
                 let mut rifle_model = ModelInstance::new(rifle.clone());
-                rifle_model.transform = remote_rifle_transform(position, yaw, current.pitch);
+                rifle_model.transform = neon::held_rifle_transform(position, yaw, current.pitch);
+                rifle_model.tint = team;
                 self.scene.models.push(rifle_model);
             }
         }
 
         self.scene.viewmodel = match (&self.rifle_asset, self.predictor.player.alive) {
             (Some(rifle), true) => {
+                let reload_total = openstrike_core::weapon::WeaponConfig::default().reload_time;
+                let reload = if self.reload_left > 0.0 {
+                    1.0 - self.reload_left / reload_total
+                } else {
+                    0.0
+                };
+                let bob = Vec2::new(
+                    (self.bob_phase * 0.5).sin() * 1.1,
+                    -self.bob_phase.sin().abs() * 0.7,
+                ) * self.bob_amount.clamp(0.0, 1.0);
                 let mut model = ModelInstance::new(rifle.clone());
                 model.transform = viewmodel_transform(
                     self.camera.pos,
                     self.view_yaw,
                     self.view_pitch,
                     self.local_recoil,
+                    reload,
+                    self.sway,
+                    bob,
                 );
+                if let Some(slot) = self.slot {
+                    model.tint = neon::team_color(slot);
+                }
                 Some(model)
             }
             _ => None,
@@ -1073,102 +1223,68 @@ impl DesktopGame {
         self.scene.sprites.clear();
         self.scene.beams.clear();
         self.emit_shot_effects();
-        self.compose_hud(size);
+
+        let fiber_released = self.guard.as_ref().map(|guard| {
+            PlayerSlot::ALL
+                .into_iter()
+                .map(|payer| guard.released_total(payer))
+                .sum::<u128>()
+        });
+        let floaters = self
+            .floaters
+            .iter()
+            .map(|floater| neon::FloaterState {
+                text: &floater.text,
+                t: floater.age / floater.ttl,
+                color: floater.color,
+            })
+            .collect();
+        neon::draw_hud(
+            &mut self.hud,
+            &neon::HudState {
+                status: &self.status,
+                slot: self.slot,
+                phase: self.phase,
+                local: self.local_snapshot,
+                remote: self.remote.current,
+                fiber_released,
+                recoil: self.local_recoil,
+                reload_left: self.reload_left,
+                hit_marker: self.hit_marker,
+                damage_flash: self.damage_flash,
+                fight_banner: self.fight_banner,
+                floaters,
+                fatal_error: self.fatal_error.as_deref(),
+            },
+            size,
+        );
     }
 
     fn emit_shot_effects(&mut self) {
         for effect in &self.shot_effects {
             let f = 1.0 - (effect.age / effect.ttl).clamp(0.0, 1.0);
+            let [r, g, b, _] = effect.color;
             self.scene.sprites.push(Sprite {
                 pos: effect.a,
-                size: 18.0 + 8.0 * f,
-                color: [1.0, 0.82, 0.35, 0.9 * f],
+                size: 16.0 + 10.0 * f,
+                color: [r, g, b, 0.9 * f],
             });
             self.scene.beams.push(Beam {
                 a: effect.a,
                 b: effect.b,
-                width: 1.8,
-                color: [1.0, 0.92, 0.55, 0.75 * f],
+                width: 1.6,
+                color: [r, g, b, 0.7 * f],
             });
-        }
-    }
-
-    fn compose_hud(&mut self, size: (u32, u32)) {
-        self.hud.clear();
-        let width = size.0 as f32;
-        let height = size.1 as f32;
-        self.hud.crosshair(
-            width * 0.5,
-            height * 0.5,
-            4.0,
-            8.0,
-            2.0,
-            [0.8, 1.0, 0.8, 0.9],
-        );
-        self.hud.text(16.0, 16.0, 2.0, [1.0; 4], &self.status);
-        self.hud.text(
-            16.0,
-            44.0,
-            1.5,
-            [0.8, 0.9, 1.0, 0.9],
-            &format!(
-                "SLOT {:?}  PHASE {:?}{}",
-                self.slot,
-                self.phase,
-                if self.dev_arena { "  DEV ARENA" } else { "" }
-            ),
-        );
-        if let Some(local) = self.local_snapshot {
-            self.hud.text(
-                24.0,
-                height - 58.0,
-                2.5,
-                [1.0, 0.85, 0.7, 1.0],
-                &format!(
-                    "HP {:03}   AMMO {:02}/{:02}",
-                    local.health, local.ammo, local.reserve
-                ),
-            );
-        }
-        if let Some(remote) = self.remote.current {
-            let text = format!("OPP HP {:03}", remote.health);
-            let text_width = Hud::text_width(&text, 1.8);
-            self.hud.text(
-                (width - text_width) * 0.5,
-                76.0,
-                1.8,
-                [1.0, 0.72, 0.55, 0.95],
-                &text,
-            );
-        }
-        if let Some(guard) = &self.guard {
-            let released = PlayerSlot::ALL
-                .into_iter()
-                .map(|payer| guard.released_total(payer))
-                .sum::<u128>();
-            let text = format!(
-                "FIBER RELEASED {}  OPS {}",
-                released, self.pending_operations
-            );
-            let text_width = Hud::text_width(&text, 1.5);
-            self.hud.text(
-                (width - text_width - 16.0).max(16.0),
-                16.0,
-                1.5,
-                [0.65, 1.0, 0.75, 0.95],
-                &text,
-            );
-        }
-        if let Some(error) = &self.fatal_error {
-            self.hud
-                .text_centered(width * 0.5, height * 0.33, 2.0, [1.0, 0.3, 0.3, 1.0], error);
         }
     }
 }
 
 impl Game for DesktopGame {
     fn init(&mut self, gpu: &Gpu, renderer: &mut Renderer) -> Result<()> {
-        if let Some(sun) = self.map.sun {
+        if self.dev_arena {
+            self.scene.sky = neon::neon_sky();
+            self.scene.lighting = neon::neon_lighting();
+        } else if let Some(sun) = self.map.sun {
             self.scene.sky.sun_dir = sun.dir;
             self.scene.lighting.sun_dir = sun.dir;
             self.scene.lighting.sun_color = sun.color * 0.9;
@@ -1179,7 +1295,7 @@ impl Game for DesktopGame {
             &renderer.samplers,
             &self.map,
         )));
-        self.rifle_asset = Some(build_rifle(gpu, renderer));
+        self.rifle_asset = Some(neon::build_rifle(gpu, renderer));
         let soldier = ModelAsset::load_glb(
             gpu,
             &renderer.model_material_layout,
@@ -1202,6 +1318,10 @@ impl Game for DesktopGame {
             .iter()
             .position(|clip| clip.name.eq_ignore_ascii_case("run"))
             .unwrap_or(self.walk_clip);
+        self.death_clip = soldier
+            .clips
+            .iter()
+            .position(|clip| clip.name.eq_ignore_ascii_case("death"));
         self.soldier_asset = Some(soldier);
         Ok(())
     }
@@ -1211,13 +1331,20 @@ impl Game for DesktopGame {
         self.view_yaw -= delta.x * openstrike_core::sim::MOUSE_SENS;
         self.view_pitch = (self.view_pitch - delta.y * openstrike_core::sim::MOUSE_SENS)
             .clamp(-89f32.to_radians(), 89f32.to_radians());
+        // Feed the view-model sway (scaled down, clamped at consumption).
+        self.sway_input += Vec2::new(delta.x, delta.y) * 0.012;
     }
 
     fn tick(&mut self, dt: f32, input: &Input) {
         self.tick_visual_effects(dt);
         self.update_network(dt, input);
-        self.remote
-            .advance_animation(dt, self.idle_clip, self.walk_clip, self.run_clip);
+        self.remote.advance_animation(
+            dt,
+            self.idle_clip,
+            self.walk_clip,
+            self.run_clip,
+            self.death_clip,
+        );
     }
 
     fn compose(&mut self, alpha: f32, time: f32, size: (u32, u32)) -> (&Scene, &Camera, &Hud) {
@@ -1266,397 +1393,35 @@ fn lerp_angle(from: f32, to: f32, alpha: f32) -> f32 {
     from + delta * alpha.clamp(0.0, 1.0)
 }
 
-fn viewmodel_transform(eye: Vec3, yaw: f32, pitch: f32, recoil: f32) -> Mat4 {
+/// First-person rifle transform: base pose plus recoil kick, reload dip,
+/// mouse sway lag, and walk bob — all additive and renderer-side only.
+fn viewmodel_transform(
+    eye: Vec3,
+    yaw: f32,
+    pitch: f32,
+    recoil: f32,
+    reload: f32,
+    sway: Vec2,
+    bob: Vec2,
+) -> Mat4 {
+    let dip = (reload * std::f32::consts::PI).sin();
     Mat4::from_translation(eye)
         * Mat4::from_rotation_y(yaw)
         * Mat4::from_rotation_x(pitch)
-        * Mat4::from_translation(Vec3::new(7.2, -7.0, -8.5 + recoil * 2.8))
-        * Mat4::from_rotation_x(recoil * 0.10)
-        * Mat4::from_rotation_y(-0.03)
-}
-
-fn remote_rifle_transform(position: Vec3, yaw: f32, pitch: f32) -> Mat4 {
-    Mat4::from_translation(position + Vec3::new(4.0, 19.0, -3.0))
-        * Mat4::from_rotation_y(yaw)
-        * Mat4::from_rotation_x(pitch.clamp(-0.65, 0.65))
-        * Mat4::from_rotation_y(-0.03)
+        * Mat4::from_translation(Vec3::new(
+            7.2 - sway.x + bob.x,
+            -7.0 + sway.y + bob.y - dip * 5.5,
+            -8.5 + recoil * 2.8,
+        ))
+        * Mat4::from_rotation_x(recoil * 0.10 - dip * 0.55)
+        * Mat4::from_rotation_z(-sway.x * 0.04 - dip * 0.25)
+        * Mat4::from_rotation_y(-0.03 - sway.x * 0.015)
 }
 
 fn view_direction(yaw: f32, pitch: f32) -> Vec3 {
     let (sy, cy) = yaw.sin_cos();
     let (sp, cp) = pitch.sin_cos();
     Vec3::new(-sy * cp, sp, -cy * cp)
-}
-
-fn development_map() -> MapData {
-    use pocket3d::bsp::{
-        Batch, DecodedTexture, MapGeometry, SpawnPoint, SunLight, SurfaceKind, WorldVertexData,
-        lightmap::PAGE_SIZE, mesh::GeometryStats,
-    };
-
-    fn texture(name: &str, a: [u8; 4], b: [u8; 4]) -> DecodedTexture {
-        DecodedTexture {
-            name: name.into(),
-            width: 2,
-            height: 2,
-            rgba: [a, b, b, a].into_iter().flatten().collect(),
-            has_alpha: false,
-        }
-    }
-
-    fn push_quad(
-        vertices: &mut Vec<WorldVertexData>,
-        indices: &mut Vec<u32>,
-        batches: &mut Vec<Batch>,
-        texture: usize,
-        points: [Vec3; 4],
-        uv: [[f32; 2]; 4],
-    ) {
-        let base = vertices.len() as u32;
-        let first_index = indices.len() as u32;
-        for (pos, uv) in points.into_iter().zip(uv) {
-            vertices.push(WorldVertexData {
-                pos: pos.to_array(),
-                uv,
-                lm_uv: [uv[0].fract().abs(), uv[1].fract().abs()],
-            });
-        }
-        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-        batches.push(Batch {
-            texture,
-            lm_page: 0,
-            kind: SurfaceKind::Opaque,
-            first_index,
-            index_count: 6,
-        });
-    }
-
-    fn push_box(
-        vertices: &mut Vec<WorldVertexData>,
-        indices: &mut Vec<u32>,
-        batches: &mut Vec<Batch>,
-        texture: usize,
-        min: Vec3,
-        max: Vec3,
-    ) {
-        let uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
-        push_quad(
-            vertices,
-            indices,
-            batches,
-            texture,
-            [
-                Vec3::new(min.x, min.y, min.z),
-                Vec3::new(max.x, min.y, min.z),
-                Vec3::new(max.x, max.y, min.z),
-                Vec3::new(min.x, max.y, min.z),
-            ],
-            uv,
-        );
-        push_quad(
-            vertices,
-            indices,
-            batches,
-            texture,
-            [
-                Vec3::new(max.x, min.y, max.z),
-                Vec3::new(min.x, min.y, max.z),
-                Vec3::new(min.x, max.y, max.z),
-                Vec3::new(max.x, max.y, max.z),
-            ],
-            uv,
-        );
-        push_quad(
-            vertices,
-            indices,
-            batches,
-            texture,
-            [
-                Vec3::new(min.x, min.y, max.z),
-                Vec3::new(min.x, min.y, min.z),
-                Vec3::new(min.x, max.y, min.z),
-                Vec3::new(min.x, max.y, max.z),
-            ],
-            uv,
-        );
-        push_quad(
-            vertices,
-            indices,
-            batches,
-            texture,
-            [
-                Vec3::new(max.x, min.y, min.z),
-                Vec3::new(max.x, min.y, max.z),
-                Vec3::new(max.x, max.y, max.z),
-                Vec3::new(max.x, max.y, min.z),
-            ],
-            uv,
-        );
-        push_quad(
-            vertices,
-            indices,
-            batches,
-            texture,
-            [
-                Vec3::new(min.x, max.y, min.z),
-                Vec3::new(max.x, max.y, min.z),
-                Vec3::new(max.x, max.y, max.z),
-                Vec3::new(min.x, max.y, max.z),
-            ],
-            uv,
-        );
-    }
-
-    let floor_y = -36.0;
-    let extent = 512.0;
-    let wall_h = 130.0;
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
-    let mut batches = Vec::new();
-    let floor_uv = [[0.0, 0.0], [0.0, 20.0], [20.0, 20.0], [20.0, 0.0]];
-    push_quad(
-        &mut vertices,
-        &mut indices,
-        &mut batches,
-        0,
-        [
-            Vec3::new(-extent, floor_y, -extent),
-            Vec3::new(-extent, floor_y, extent),
-            Vec3::new(extent, floor_y, extent),
-            Vec3::new(extent, floor_y, -extent),
-        ],
-        floor_uv,
-    );
-    let wall_uv = [[0.0, 0.0], [16.0, 0.0], [16.0, 3.0], [0.0, 3.0]];
-    for wall in [
-        [
-            Vec3::new(-extent, floor_y, -extent),
-            Vec3::new(extent, floor_y, -extent),
-            Vec3::new(extent, floor_y + wall_h, -extent),
-            Vec3::new(-extent, floor_y + wall_h, -extent),
-        ],
-        [
-            Vec3::new(extent, floor_y, extent),
-            Vec3::new(-extent, floor_y, extent),
-            Vec3::new(-extent, floor_y + wall_h, extent),
-            Vec3::new(extent, floor_y + wall_h, extent),
-        ],
-        [
-            Vec3::new(-extent, floor_y, extent),
-            Vec3::new(-extent, floor_y, -extent),
-            Vec3::new(-extent, floor_y + wall_h, -extent),
-            Vec3::new(-extent, floor_y + wall_h, extent),
-        ],
-        [
-            Vec3::new(extent, floor_y, -extent),
-            Vec3::new(extent, floor_y, extent),
-            Vec3::new(extent, floor_y + wall_h, extent),
-            Vec3::new(extent, floor_y + wall_h, -extent),
-        ],
-    ] {
-        push_quad(&mut vertices, &mut indices, &mut batches, 1, wall, wall_uv);
-    }
-    let pad = 74.0;
-    let pad_uv = [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]];
-    for (z, texture) in [(100.0, 2), (-100.0, 3)] {
-        push_quad(
-            &mut vertices,
-            &mut indices,
-            &mut batches,
-            texture,
-            [
-                Vec3::new(-pad, floor_y + 0.6, z - pad),
-                Vec3::new(-pad, floor_y + 0.6, z + pad),
-                Vec3::new(pad, floor_y + 0.6, z + pad),
-                Vec3::new(pad, floor_y + 0.6, z - pad),
-            ],
-            pad_uv,
-        );
-    }
-    push_box(
-        &mut vertices,
-        &mut indices,
-        &mut batches,
-        4,
-        Vec3::new(-18.0, floor_y, -22.0),
-        Vec3::new(18.0, floor_y + 48.0, 22.0),
-    );
-    push_box(
-        &mut vertices,
-        &mut indices,
-        &mut batches,
-        4,
-        Vec3::new(-300.0, floor_y, -210.0),
-        Vec3::new(-220.0, floor_y + 55.0, -130.0),
-    );
-    push_box(
-        &mut vertices,
-        &mut indices,
-        &mut batches,
-        4,
-        Vec3::new(220.0, floor_y, 130.0),
-        Vec3::new(300.0, floor_y + 55.0, 210.0),
-    );
-
-    let textures = vec![
-        texture("brushed-floor", [62, 66, 70, 255], [104, 112, 120, 255]),
-        texture("concrete-wall", [96, 94, 88, 255], [132, 128, 118, 255]),
-        texture("blue-spawn", [42, 88, 150, 255], [78, 134, 210, 255]),
-        texture("red-spawn", [156, 56, 44, 255], [220, 94, 78, 255]),
-        texture("cover-crate", [92, 72, 52, 255], [138, 105, 72, 255]),
-    ];
-    let mut lightmap = vec![230; (PAGE_SIZE * PAGE_SIZE * 4) as usize];
-    for alpha in lightmap.iter_mut().skip(3).step_by(4) {
-        *alpha = 255;
-    }
-
-    MapData {
-        name: "development-arena".into(),
-        geometry: MapGeometry {
-            vertices,
-            indices,
-            batches,
-            lightmap_pages: vec![lightmap],
-            stats: GeometryStats {
-                faces_drawn: 1 + 4 + 2 + 5 * 3,
-                faces_skipped: 0,
-                triangles: 2 + 8 + 4 + 10 * 3,
-            },
-        },
-        textures,
-        entities: Vec::new(),
-        collision: openstrike_fiber_arena::openstrike::empty_collision(),
-        ct_spawns: vec![SpawnPoint {
-            pos: Vec3::new(0.0, 0.0, 100.0),
-            yaw: 0.0,
-        }],
-        t_spawns: vec![SpawnPoint {
-            pos: Vec3::new(0.0, 0.0, -100.0),
-            yaw: std::f32::consts::PI,
-        }],
-        sun: Some(SunLight {
-            dir: Vec3::new(0.25, 0.72, 0.45).normalize(),
-            color: Vec3::new(1.0, 0.95, 0.86),
-        }),
-        bounds: (
-            Vec3::new(-extent, floor_y, -extent),
-            Vec3::new(extent, 128.0, extent),
-        ),
-    }
-}
-
-fn build_rifle(gpu: &Gpu, renderer: &Renderer) -> Arc<ModelAsset> {
-    use openstrike_core::weapon::{GUN_COLORS, rifle_boxes};
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
-    for rifle_box in rifle_boxes() {
-        add_box(
-            &mut vertices,
-            &mut indices,
-            rifle_box.min,
-            rifle_box.max,
-            rifle_box.color,
-        );
-    }
-    let pixels: Vec<_> = GUN_COLORS.into_iter().flatten().collect();
-    ModelAsset::from_geometry(
-        gpu,
-        &renderer.model_material_layout,
-        &renderer.samplers,
-        "arena rifle",
-        &vertices,
-        &indices,
-        Some((GUN_COLORS.len() as u32, 1, &pixels)),
-    )
-}
-
-fn add_box(
-    vertices: &mut Vec<ModelVertex>,
-    indices: &mut Vec<u32>,
-    min: Vec3,
-    max: Vec3,
-    color: usize,
-) {
-    let uv = [
-        (color as f32 + 0.5) / openstrike_core::weapon::GUN_COLORS.len() as f32,
-        0.5,
-    ];
-    let corner = |x: f32, y: f32, z: f32| {
-        Vec3::new(
-            if x > 0.0 { max.x } else { min.x },
-            if y > 0.0 { max.y } else { min.y },
-            if z > 0.0 { max.z } else { min.z },
-        )
-    };
-    let faces = [
-        (
-            Vec3::X,
-            [
-                corner(1.0, -1.0, 1.0),
-                corner(1.0, -1.0, -1.0),
-                corner(1.0, 1.0, -1.0),
-                corner(1.0, 1.0, 1.0),
-            ],
-        ),
-        (
-            -Vec3::X,
-            [
-                corner(-1.0, -1.0, -1.0),
-                corner(-1.0, -1.0, 1.0),
-                corner(-1.0, 1.0, 1.0),
-                corner(-1.0, 1.0, -1.0),
-            ],
-        ),
-        (
-            Vec3::Y,
-            [
-                corner(-1.0, 1.0, 1.0),
-                corner(1.0, 1.0, 1.0),
-                corner(1.0, 1.0, -1.0),
-                corner(-1.0, 1.0, -1.0),
-            ],
-        ),
-        (
-            -Vec3::Y,
-            [
-                corner(-1.0, -1.0, -1.0),
-                corner(1.0, -1.0, -1.0),
-                corner(1.0, -1.0, 1.0),
-                corner(-1.0, -1.0, 1.0),
-            ],
-        ),
-        (
-            Vec3::Z,
-            [
-                corner(-1.0, -1.0, 1.0),
-                corner(1.0, -1.0, 1.0),
-                corner(1.0, 1.0, 1.0),
-                corner(-1.0, 1.0, 1.0),
-            ],
-        ),
-        (
-            -Vec3::Z,
-            [
-                corner(1.0, -1.0, -1.0),
-                corner(-1.0, -1.0, -1.0),
-                corner(-1.0, 1.0, -1.0),
-                corner(1.0, 1.0, -1.0),
-            ],
-        ),
-    ];
-    for (normal, quad) in faces {
-        let base = vertices.len() as u32;
-        for position in quad {
-            vertices.push(ModelVertex {
-                pos: position.to_array(),
-                normal: normal.to_array(),
-                uv,
-                joints: [0; 4],
-                weights: [1.0, 0.0, 0.0, 0.0],
-            });
-        }
-        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-    }
 }
 
 #[cfg(test)]
