@@ -15,6 +15,16 @@ name = "arena-desktop"
 path = "src/bin/arena-desktop.rs"
 required-features = ["desktop"]
 
+[[bin]]
+name = "build-duelist"
+path = "src/bin/build-duelist.rs"
+required-features = ["openstrike"]
+
+[[bin]]
+name = "arena-shot"
+path = "src/bin/arena-shot.rs"
+required-features = ["desktop"]
+
 [dependencies]
 anyhow = "1.0"
 blake3 = "1.8"
