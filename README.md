@@ -50,6 +50,44 @@ first person input. It adds local movement prediction, authoritative
 reconciliation, remote-player interpolation, and the same Fiber spending
 guard used by the headless client.
 
+## Invite-code rooms
+
+`arena-matchmaker` is a small HTTP room service for public developer demos.
+The first player creates an eight-character room code; the second joins that
+code. Their names, fixed A/B seats, and real local FNN identity pubkeys are
+bound into short-lived encrypted Netcode tokens. A third player gets an
+explicit `409 room_full` response and never reaches the game UDP socket.
+
+Each full room reserves one preconfigured UDP endpoint and starts an isolated
+`arena-server` child. The endpoint is recycled when the match ends, a player
+forfeits by disconnecting, or the room TTL expires. The HTTP service never
+receives a wallet key or calls a player's FNN. `--mock-payments` is rejected
+when a client uses `--matchmaker`.
+
+Player A creates a room and prints its code:
+
+```sh
+cargo run --features desktop --bin arena-desktop -- \
+  --name alice --matchmaker https://arena.example.com \
+  --fiber-rpc http://127.0.0.1:8227 --dev-arena
+```
+
+Player B uses the shared code:
+
+```sh
+cargo run --features desktop --bin arena-desktop -- \
+  --name bob --matchmaker https://arena.example.com --room ABCD2345 \
+  --fiber-rpc http://127.0.0.1:8227 --dev-arena
+```
+
+Both FNNs still need reusable outbound liquidity to the opponent. The existing
+client-side channel check and hold-invoice handshake run after the room is
+ready and before gameplay begins.
+
+See [docs/public-matchmaking.md](docs/public-matchmaking.md) for the HTTP API,
+UDP endpoint pool, Cloudflare/Playit split, Bear deployment, lifecycle, and
+security boundaries.
+
 ## Built-in neon arena
 
 With `--dev-arena` the game needs no external assets at all: it ships an

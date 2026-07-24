@@ -26,6 +26,30 @@ match setup, invoice offers, dual readiness acknowledgements, and preimages.
 Each local FNN owns its wallet keys and performs all invoice/payment RPC calls.
 The arena server never receives a wallet key or FNN RPC credential.
 
+For the public invite-room deployment, a third HTTP control plane sits before
+Renet:
+
+```text
+room code + name + local FNN pubkey
+                  |
+                  v
+          arena-matchmaker
+       (Cloudflare HTTPS ingress)
+                  |
+       seat-bound connect tokens
+                  |
+       one UDP endpoint + process
+                  v
+            arena-server
+         (Playit UDP ingress)
+```
+
+The room service is not a payment proxy. It allocates an isolated game process,
+binds two public identities to seats, and returns bearer connect tokens. The
+clients still contact their local FNNs directly. The configured UDP endpoint
+pool is the explicit concurrency limit, and a third player joining a full room
+is rejected before any game connection is attempted.
+
 ## Hold-invoice lifecycle
 
 The server generates four random preimages per payer by default and publishes
@@ -82,6 +106,11 @@ check.
 
 Settlement releases use a separate file-backed Ed25519 key so transport
 authentication and game-event authorization do not share a secret.
+
+The matchmaker may read the Netcode key to issue tokens, but not the settlement
+signing key contents; it passes the signing-key path to the isolated server
+process. Room-ticket responses are private bearer data and must use HTTPS and
+must not be cached.
 
 | Renet channel | Direction | Payload |
 | --- | --- | --- |

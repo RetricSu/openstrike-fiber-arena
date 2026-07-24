@@ -11,16 +11,17 @@ use openstrike_fiber_arena::{
     TICK_HZ,
     client::SettlementGuard,
     fiber::{FiberCurrency, FiberRpcClient, HoldInvoiceExpectation},
+    matchmaking::{EnterRoomRequest, MatchmakerClient},
     net::{init_tracing, unix_ms, unix_time},
     protocol::{
         ClientMessage, HoldInvoiceAck, HoldInvoiceFailure, HoldInvoiceOffer, HoldInvoiceStage,
         HoldInvoiceTerm, InputFrame, MatchPhase, MatchTerms, PlayerSlot, ServerMessage, decode,
         encode,
     },
-    security::client_authentication,
+    security::{client_authentication, client_authentication_with_token},
 };
 use renet::{ConnectionConfig, DefaultChannel, RenetClient};
-use renet_netcode::NetcodeClientTransport;
+use renet_netcode::{ConnectToken, NetcodeClientTransport};
 use tracing::{error, info, warn};
 
 #[derive(Debug, Parser)]
@@ -32,6 +33,13 @@ struct Args {
     name: String,
     #[arg(long, conflicts_with = "dev_unsecure")]
     connect_token: Option<PathBuf>,
+    /// HTTP room service. Omit --room to create a room and print its code.
+    #[arg(long, conflicts_with_all = ["connect_token", "dev_unsecure"])]
+    matchmaker: Option<String>,
+    #[arg(long, requires = "matchmaker")]
+    room: Option<String>,
+    #[arg(long, default_value_t = 300)]
+    matchmaking_timeout_seconds: u64,
     #[arg(long, default_value_t = false)]
     dev_unsecure: bool,
     #[arg(long, default_value_t = false)]
@@ -53,16 +61,28 @@ async fn main() -> Result<()> {
     if !args.mock_payments && args.fiber_rpc.is_none() {
         bail!("choose --mock-payments or configure --fiber-rpc");
     }
+    if args.matchmaker.is_some() && args.mock_payments {
+        bail!("HTTP matchmaking requires a real local FNN; --mock-payments is not allowed");
+    }
+    if args.matchmaker.is_some() && args.matchmaking_timeout_seconds == 0 {
+        bail!("--matchmaking-timeout-seconds must be positive");
+    }
+    let (server, matchmaker_token) = resolve_connection(&args).await?;
 
     let socket = UdpSocket::bind("0.0.0.0:0").context("binding client UDP socket")?;
     let client_id = unix_time().as_nanos().min(u64::MAX as u128) as u64;
-    let auth = client_authentication(
-        args.connect_token.as_deref(),
-        args.dev_unsecure,
-        args.server,
-        client_id,
-        &args.name,
-    )?;
+    let auth = match matchmaker_token {
+        Some(token) => {
+            client_authentication_with_token(Some(token), false, server, client_id, &args.name)?
+        }
+        None => client_authentication(
+            args.connect_token.as_deref(),
+            args.dev_unsecure,
+            server,
+            client_id,
+            &args.name,
+        )?,
+    };
     let mut transport = NetcodeClientTransport::new(unix_time(), auth, socket)?;
     let mut network = RenetClient::new(ConnectionConfig::default());
     let fiber = args.fiber_rpc.as_ref().map(FiberRpcClient::new);
@@ -81,7 +101,7 @@ async fn main() -> Result<()> {
     let mut match_end_received = false;
     let mut exit_after = None;
 
-    info!(name = %args.name, server = %args.server, "connecting");
+    info!(name = %args.name, %server, "connecting");
     loop {
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(last_update);
@@ -341,6 +361,53 @@ async fn main() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
+}
+
+async fn resolve_connection(args: &Args) -> Result<(SocketAddr, Option<ConnectToken>)> {
+    let Some(matchmaker_url) = &args.matchmaker else {
+        return Ok((args.server, None));
+    };
+    let fiber_rpc = args
+        .fiber_rpc
+        .as_deref()
+        .context("--matchmaker requires --fiber-rpc or FIBER_RPC_URL")?;
+    let node = FiberRpcClient::new(fiber_rpc)
+        .node_info()
+        .await
+        .context("reading the local FNN identity for matchmaking")?;
+    let client = MatchmakerClient::new(matchmaker_url)?;
+    let request = EnterRoomRequest {
+        name: args.name.clone(),
+        fiber_pubkey: node.pubkey,
+    };
+    let initial = match &args.room {
+        Some(room) => client.join_room(room, &request).await?,
+        None => client.create_room(&request).await?,
+    };
+    println!("ROOM CODE: {}", initial.room_code);
+    info!(
+        room = %initial.room_code,
+        slot = ?initial.slot,
+        "waiting for opponent"
+    );
+    let room_code = initial.room_code.clone();
+    let ticket_secret = initial.ticket.clone();
+    let ready = match client
+        .wait_until_ready(
+            initial,
+            Duration::from_secs(args.matchmaking_timeout_seconds),
+        )
+        .await
+    {
+        Ok(ready) => ready,
+        Err(error) => {
+            let _ = client.leave(&room_code, &ticket_secret).await;
+            return Err(error);
+        }
+    };
+    let (server, token) = ready.ready_connection()?;
+    info!(room = %ready.room_code, %server, "room ready");
+    Ok((server, Some(token)))
 }
 
 #[allow(clippy::too_many_arguments)]

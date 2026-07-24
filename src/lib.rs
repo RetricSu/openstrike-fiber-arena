@@ -2,6 +2,7 @@ pub mod client;
 #[cfg(feature = "openstrike")]
 pub mod devmap;
 pub mod fiber;
+pub mod matchmaking;
 #[cfg(feature = "desktop")]
 pub mod neon;
 pub mod net;

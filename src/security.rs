@@ -5,10 +5,15 @@ use std::{
     path::Path,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
+use rand_core::{OsRng, RngCore};
 use renet_netcode::{ClientAuthentication, ConnectToken};
 
-use crate::{PROTOCOL_ID, net::encode_player_name, net::unix_time};
+use crate::{
+    PROTOCOL_ID,
+    net::{encode_player_identity, encode_player_name, normalize_fiber_pubkey, unix_time},
+    protocol::{PlayerBinding, PlayerSlot},
+};
 
 pub fn load_secret_32(path: &Path, label: &str) -> Result<[u8; 32]> {
     ensure_private_permissions(path, label)?;
@@ -16,11 +21,19 @@ pub fn load_secret_32(path: &Path, label: &str) -> Result<[u8; 32]> {
     parse_secret_32(&contents, label)
 }
 
+pub fn validate_private_file(path: &Path, label: &str) -> Result<()> {
+    ensure_private_permissions(path, label)
+}
+
 pub fn read_connect_token(path: &Path) -> Result<ConnectToken> {
     ensure_private_permissions(path, "connect token")?;
     let bytes =
         fs::read(path).with_context(|| format!("reading connect token {}", path.display()))?;
-    let mut cursor = Cursor::new(bytes.as_slice());
+    decode_connect_token(&bytes)
+}
+
+pub fn decode_connect_token(bytes: &[u8]) -> Result<ConnectToken> {
+    let mut cursor = Cursor::new(bytes);
     let token = ConnectToken::read(&mut cursor).context("decoding connect token")?;
     if cursor.position() != bytes.len() as u64 {
         bail!("connect token contains trailing data");
@@ -34,6 +47,60 @@ pub fn read_connect_token(path: &Path) -> Result<ConnectToken> {
     Ok(token)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn issue_connect_token(
+    netcode_key: &[u8; 32],
+    server: SocketAddr,
+    name: String,
+    slot: PlayerSlot,
+    fiber_pubkey: String,
+    client_id: Option<u64>,
+    expire_seconds: u64,
+    timeout_seconds: i32,
+) -> Result<(Vec<u8>, u64, PlayerBinding)> {
+    ensure!(expire_seconds > 0, "--expire-seconds must be positive");
+    ensure!(
+        expire_seconds <= 3_600,
+        "--expire-seconds must not exceed one hour"
+    );
+    ensure!(timeout_seconds > 0, "--timeout-seconds must be positive");
+    ensure!(
+        !server.ip().is_unspecified() && server.port() != 0,
+        "--server must be a reachable public address"
+    );
+    let client_id = client_id.unwrap_or_else(|| {
+        loop {
+            let value = OsRng.next_u64();
+            if value != 0 {
+                break value;
+            }
+        }
+    });
+    let binding = PlayerBinding {
+        name,
+        fiber_pubkey: normalize_fiber_pubkey(&fiber_pubkey)
+            .map_err(anyhow::Error::msg)
+            .context("validating Fiber pubkey")?,
+    };
+    let user_data = encode_player_identity(slot, &binding)
+        .map_err(anyhow::Error::msg)
+        .context("encoding authenticated player identity")?;
+    let token = ConnectToken::generate(
+        unix_time(),
+        PROTOCOL_ID,
+        expire_seconds,
+        client_id,
+        timeout_seconds,
+        vec![server],
+        Some(&user_data),
+        netcode_key,
+    )
+    .context("generating connect token")?;
+    let mut bytes = Vec::new();
+    token.write(&mut bytes).context("encoding connect token")?;
+    Ok((bytes, client_id, binding))
+}
+
 pub fn client_authentication(
     connect_token: Option<&Path>,
     dev_unsecure: bool,
@@ -41,10 +108,25 @@ pub fn client_authentication(
     client_id: u64,
     player_name: &str,
 ) -> Result<ClientAuthentication> {
+    let connect_token = connect_token.map(read_connect_token).transpose()?;
+    client_authentication_with_token(
+        connect_token,
+        dev_unsecure,
+        server_addr,
+        client_id,
+        player_name,
+    )
+}
+
+pub fn client_authentication_with_token(
+    connect_token: Option<ConnectToken>,
+    dev_unsecure: bool,
+    server_addr: SocketAddr,
+    client_id: u64,
+    player_name: &str,
+) -> Result<ClientAuthentication> {
     match (connect_token, dev_unsecure) {
-        (Some(path), false) => Ok(ClientAuthentication::Secure {
-            connect_token: read_connect_token(path)?,
-        }),
+        (Some(connect_token), false) => Ok(ClientAuthentication::Secure { connect_token }),
         (None, true) => Ok(ClientAuthentication::Unsecure {
             server_addr,
             client_id,

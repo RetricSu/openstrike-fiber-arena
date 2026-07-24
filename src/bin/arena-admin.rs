@@ -4,13 +4,10 @@ use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
 use openstrike_fiber_arena::{
-    PROTOCOL_ID,
-    net::{encode_player_identity, normalize_fiber_pubkey, unix_time},
-    protocol::{PlayerBinding, PlayerSlot},
-    security::{load_secret_32, write_private_file, write_public_file},
+    protocol::PlayerSlot,
+    security::{issue_connect_token, load_secret_32, write_private_file, write_public_file},
 };
 use rand_core::{OsRng, RngCore};
-use renet_netcode::ConnectToken;
 
 #[derive(Debug, Parser)]
 #[command(about = "Generate Arena server keys and short-lived Renet connect tokens")]
@@ -137,47 +134,17 @@ fn issue_token(
     expire_seconds: u64,
     timeout_seconds: i32,
 ) -> Result<()> {
-    ensure!(expire_seconds > 0, "--expire-seconds must be positive");
-    ensure!(
-        expire_seconds <= 3_600,
-        "--expire-seconds must not exceed one hour"
-    );
-    ensure!(timeout_seconds > 0, "--timeout-seconds must be positive");
-    ensure!(
-        !server.ip().is_unspecified() && server.port() != 0,
-        "--server must be a reachable public address"
-    );
     let key = load_secret_32(&netcode_key, "Netcode private key")?;
-    let client_id = client_id.unwrap_or_else(|| {
-        loop {
-            let value = OsRng.next_u64();
-            if value != 0 {
-                break value;
-            }
-        }
-    });
-    let binding = PlayerBinding {
-        name: name.clone(),
-        fiber_pubkey: normalize_fiber_pubkey(&fiber_pubkey)
-            .map_err(anyhow::Error::msg)
-            .context("validating --fiber-pubkey")?,
-    };
-    let user_data = encode_player_identity(slot, &binding)
-        .map_err(anyhow::Error::msg)
-        .context("encoding authenticated player identity")?;
-    let token = ConnectToken::generate(
-        unix_time(),
-        PROTOCOL_ID,
-        expire_seconds,
-        client_id,
-        timeout_seconds,
-        vec![server],
-        Some(&user_data),
+    let (bytes, client_id, binding) = issue_connect_token(
         &key,
-    )
-    .context("generating connect token")?;
-    let mut bytes = Vec::new();
-    token.write(&mut bytes).context("encoding connect token")?;
+        server,
+        name.clone(),
+        slot,
+        fiber_pubkey,
+        client_id,
+        expire_seconds,
+        timeout_seconds,
+    )?;
     write_private_file(&output, &bytes)?;
     println!(
         "issued token for {name} as {slot:?} with Fiber {} (client {client_id}) to {}",

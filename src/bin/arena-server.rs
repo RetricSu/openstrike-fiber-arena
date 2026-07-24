@@ -51,6 +51,17 @@ struct Args {
     /// FNN v0.9.0-rc7 production minimum is 160 minutes.
     #[arg(long, default_value_t = 9_600_000)]
     final_expiry_delta_ms: u64,
+    /// Exit after broadcasting MatchEnded so a supervisor can recycle this
+    /// one-match process. Omit to keep the process alive for diagnostics.
+    #[arg(long)]
+    exit_after_match_ms: Option<u64>,
+    /// Exit if every authenticated client leaves before match terms are
+    /// issued. This lets a room supervisor recycle abandoned reservations.
+    #[arg(long)]
+    exit_when_empty_ms: Option<u64>,
+    /// Exit if no authenticated client ever arrives before this deadline.
+    #[arg(long)]
+    exit_if_no_clients_ms: Option<u64>,
     /// 32-byte Netcode private key file shared only with the token issuer.
     #[arg(long, env = "ARENA_NETCODE_KEY_FILE", conflicts_with = "dev_unsecure")]
     netcode_key: Option<PathBuf>,
@@ -117,6 +128,18 @@ fn main() -> Result<()> {
         (9_600_000..=1_209_600_000).contains(&args.final_expiry_delta_ms),
         "FNN v0.9.0-rc7 requires --final-expiry-delta-ms between 9600000 and 1209600000"
     );
+    ensure!(
+        args.exit_after_match_ms.is_none_or(|delay| delay > 0),
+        "--exit-after-match-ms must be positive"
+    );
+    ensure!(
+        args.exit_when_empty_ms.is_none_or(|delay| delay > 0),
+        "--exit-when-empty-ms must be positive"
+    );
+    ensure!(
+        args.exit_if_no_clients_ms.is_none_or(|delay| delay > 0),
+        "--exit-if-no-clients-ms must be positive"
+    );
 
     let public_addr = args.public_addr.unwrap_or(args.bind);
     let socket = UdpSocket::bind(args.bind)
@@ -153,7 +176,11 @@ fn main() -> Result<()> {
             });
     let mut started = false;
     let mut ended = false;
+    let mut ended_at = None;
+    let mut saw_authenticated_client = false;
+    let mut empty_since = None;
     let mut server_tick = 0u64;
+    let server_started_at = Instant::now();
     let fixed_step = Duration::from_secs_f64(1.0 / TICK_HZ as f64);
     let mut accumulator = Duration::ZERO;
     let mut last_update = Instant::now();
@@ -167,7 +194,7 @@ fn main() -> Result<()> {
 
         network.update(elapsed);
         transport.update(elapsed, &mut network)?;
-        handle_connections(
+        let disconnected = handle_connections(
             &mut network,
             &transport,
             &mut clients,
@@ -176,6 +203,12 @@ fn main() -> Result<()> {
             args.dev_unsecure,
             settlement.is_some(),
         );
+        saw_authenticated_client |= !clients.is_empty();
+        if saw_authenticated_client && settlement.is_none() && clients.is_empty() {
+            empty_since.get_or_insert_with(Instant::now);
+        } else {
+            empty_since = None;
+        }
 
         if settlement.is_none() && clients.len() == 2 {
             let bound_players = std::array::from_fn(|index| {
@@ -207,6 +240,49 @@ fn main() -> Result<()> {
             }
             info!(%match_id, "both authenticated seats bound; preparing hold invoices");
             settlement = Some(coordinator);
+        }
+
+        if !ended
+            && !disconnected.is_empty()
+            && let Some(coordinator) = settlement.as_mut()
+        {
+            let winner = clients
+                .values()
+                .next()
+                .copied()
+                .unwrap_or_else(|| disconnected[0].opponent());
+            for term in coordinator.cancel_unused() {
+                if let Err(error) = send_reliable_to_slot(
+                    &mut network,
+                    &clients,
+                    term.payee,
+                    &ServerMessage::CancelHoldInvoice {
+                        match_id,
+                        reservation_id: term.reservation_id,
+                        payment_hash: term.payment_hash,
+                    },
+                ) {
+                    warn!(
+                        %error,
+                        ?term.payee,
+                        reservation_id = term.reservation_id,
+                        "could not deliver forfeit hold-invoice cancellation"
+                    );
+                }
+            }
+            sim.set_phase(MatchPhase::Ended { winner });
+            broadcast_reliable(
+                &mut network,
+                &ServerMessage::MatchEnded { match_id, winner },
+            )?;
+            ended = true;
+            ended_at = Some(Instant::now());
+            info!(
+                %match_id,
+                ?winner,
+                disconnected = ?disconnected,
+                "match ended by disconnect"
+            );
         }
 
         if let Some(coordinator) = settlement.as_mut() {
@@ -328,6 +404,7 @@ fn main() -> Result<()> {
                                 },
                             )?;
                             ended = true;
+                            ended_at = Some(Instant::now());
                         }
                     }
                 }
@@ -343,6 +420,25 @@ fn main() -> Result<()> {
         }
 
         transport.send_packets(&mut network);
+        if let (Some(delay_ms), Some(ended_at)) = (args.exit_after_match_ms, ended_at)
+            && ended_at.elapsed() >= Duration::from_millis(delay_ms)
+        {
+            info!(%match_id, "post-match grace period elapsed; exiting");
+            return Ok(());
+        }
+        if let (Some(delay_ms), Some(empty_since)) = (args.exit_when_empty_ms, empty_since)
+            && empty_since.elapsed() >= Duration::from_millis(delay_ms)
+        {
+            info!(%match_id, "abandoned pre-match server is empty; exiting");
+            return Ok(());
+        }
+        if let Some(delay_ms) = args.exit_if_no_clients_ms
+            && !saw_authenticated_client
+            && server_started_at.elapsed() >= Duration::from_millis(delay_ms)
+        {
+            info!(%match_id, "no client arrived before the startup deadline; exiting");
+            return Ok(());
+        }
         thread::sleep(Duration::from_millis(1));
     }
 }
@@ -356,7 +452,8 @@ fn handle_connections(
     accepted: &mut HashSet<PlayerSlot>,
     dev_unsecure: bool,
     terms_issued: bool,
-) {
+) -> Vec<PlayerSlot> {
+    let mut disconnected = Vec::new();
     while let Some(event) = network.get_event() {
         match event {
             ServerEvent::ClientConnected { client_id } => {
@@ -416,6 +513,7 @@ fn handle_connections(
             ServerEvent::ClientDisconnected { client_id, reason } => {
                 let slot = clients.remove(&client_id);
                 if let Some(slot) = slot {
+                    disconnected.push(slot);
                     accepted.remove(&slot);
                     if !terms_issued {
                         players[slot.index()] = None;
@@ -425,6 +523,7 @@ fn handle_connections(
             }
         }
     }
+    disconnected
 }
 
 fn handle_client_messages(
