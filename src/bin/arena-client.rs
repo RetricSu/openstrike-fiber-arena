@@ -29,6 +29,10 @@ use tracing::{error, info, warn};
 struct Args {
     #[arg(long, default_value = "127.0.0.1:5000")]
     server: SocketAddr,
+    /// Local UDP address. Set this to a physical-interface address when a
+    /// system-wide TUN proxy does not pass game UDP traffic.
+    #[arg(long, default_value = "0.0.0.0:0")]
+    local_bind: SocketAddr,
     #[arg(long)]
     name: String,
     #[arg(long, conflicts_with = "dev_unsecure")]
@@ -69,7 +73,8 @@ async fn main() -> Result<()> {
     }
     let (server, matchmaker_token) = resolve_connection(&args).await?;
 
-    let socket = UdpSocket::bind("0.0.0.0:0").context("binding client UDP socket")?;
+    let socket = UdpSocket::bind(args.local_bind)
+        .with_context(|| format!("binding client UDP socket to {}", args.local_bind))?;
     let client_id = unix_time().as_nanos().min(u64::MAX as u128) as u64;
     let auth = match matchmaker_token {
         Some(token) => {

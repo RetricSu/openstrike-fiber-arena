@@ -216,15 +216,19 @@ tmux send-keys -t $(sq "$tmux_session:$tmux_window") $(sq "$matchmaker_cmd") C-m
 
 remote_bash "
 set -euo pipefail
+healthy=0
 for _ in \$(seq 1 40); do
   if curl -fsS $(sq "http://$http_bind/healthz"); then
-    exit 0
+    healthy=1
+    break
   fi
   sleep 0.25
 done
-echo 'matchmaker did not become healthy' >&2
-tail -80 $(sq "$remote_dir/logs/matchmaker.log") >&2
-exit 1
+if [ \"\$healthy\" = '0' ]; then
+  echo 'matchmaker did not become healthy' >&2
+  tail -80 $(sq "$remote_dir/logs/matchmaker.log") >&2
+  false
+fi
 "
 
 echo

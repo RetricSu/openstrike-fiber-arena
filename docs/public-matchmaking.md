@@ -38,6 +38,17 @@ cancellation remain in each player's local client and FNN.
 `--mock-payments` is deliberately rejected in matchmaker mode. A public room
 therefore demonstrates the actual FNN v0.9.0-rc7 flow, not just the game UI.
 
+If a system-wide TUN proxy captures or drops arbitrary UDP, bind the game
+socket to a physical-interface address while leaving the port ephemeral:
+
+```sh
+arena-desktop ... --local-bind 192.168.1.20:0
+```
+
+The default remains `0.0.0.0:0`. This option changes only the client's local
+UDP source address; Fiber RPC and HTTPS matchmaking continue to use their
+normal routes.
+
 ## HTTP API
 
 The HTTP listener should bind to loopback and be published as HTTPS through

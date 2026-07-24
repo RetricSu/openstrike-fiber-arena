@@ -44,6 +44,10 @@ const LOCAL_FIRE_INTERVAL: f32 = 0.105;
 struct Args {
     #[arg(long, default_value = "127.0.0.1:5000")]
     server: SocketAddr,
+    /// Local UDP address. Set this to a physical-interface address when a
+    /// system-wide TUN proxy does not pass game UDP traffic.
+    #[arg(long, default_value = "0.0.0.0:0")]
+    local_bind: SocketAddr,
     #[arg(long)]
     name: String,
     #[arg(long, conflicts_with = "dev_unsecure")]
@@ -419,7 +423,8 @@ impl DesktopGame {
         spawn_yaw: f32,
         soldier_model_path: PathBuf,
     ) -> Result<Self> {
-        let socket = UdpSocket::bind("0.0.0.0:0").context("binding client UDP socket")?;
+        let socket = UdpSocket::bind(args.local_bind)
+            .with_context(|| format!("binding client UDP socket to {}", args.local_bind))?;
         let client_id = unix_time().as_nanos().min(u64::MAX as u128) as u64;
         let auth = match connection.connect_token {
             Some(token) => client_authentication_with_token(
