@@ -81,6 +81,17 @@ async fn create_join_poll_reject_third_and_recycle_endpoint() {
     let base_url = format!("http://127.0.0.1:{http_port}");
     let http = Client::new();
     wait_for_health(&http, &base_url).await;
+    let index = http
+        .get(&base_url)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(index.contains("matchmaker is online"));
 
     let alice = create(
         &http,

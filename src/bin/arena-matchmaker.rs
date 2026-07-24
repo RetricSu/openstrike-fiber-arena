@@ -522,6 +522,7 @@ async fn main() -> Result<()> {
     let http_bind = config.0;
     let state = AppState::new(config.1);
     let app = Router::new()
+        .route("/", get(index))
         .route("/healthz", get(health))
         .route("/v1/rooms", post(create_room))
         .route("/v1/rooms/{room_code}/join", post(join_room))
@@ -559,6 +560,12 @@ async fn main() -> Result<()> {
     cleanup.abort();
     state.shutdown();
     result
+}
+
+async fn index() -> &'static str {
+    "OpenStrike Fiber Arena matchmaker is online.\n\
+     Health: /healthz\n\
+     Connect with arena-desktop --matchmaker <this URL>\n"
 }
 
 async fn health(State(state): State<AppState>) -> Result<Json<MatchmakerHealth>, HttpError> {
