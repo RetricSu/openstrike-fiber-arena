@@ -14,6 +14,7 @@ use openstrike_fiber_arena::{
     client::SettlementGuard,
     devmap,
     fiber::{FiberCurrency, FiberRpcClient, HoldInvoiceExpectation},
+    matchmaking::{EnterRoomRequest, MatchmakerClient},
     neon,
     net::{unix_ms, unix_time},
     protocol::{
@@ -21,7 +22,7 @@ use openstrike_fiber_arena::{
         HoldInvoiceStage, HoldInvoiceTerm, InputFrame, MatchPhase, MatchTerms, PlayerSlot,
         PlayerSnapshot, ServerMessage, decode, encode,
     },
-    security::client_authentication,
+    security::{client_authentication, client_authentication_with_token},
 };
 use pocket3d::{
     app::{AppConfig, Game, run},
@@ -32,7 +33,7 @@ use pocket3d::{
     winit::{event::MouseButton, keyboard::KeyCode},
 };
 use renet::{ConnectionConfig, DefaultChannel, RenetClient};
-use renet_netcode::NetcodeClientTransport;
+use renet_netcode::{ConnectToken, NetcodeClientTransport};
 
 const DT: f32 = 1.0 / TICK_HZ as f32;
 const PLAYER_MODEL_HEIGHT: f32 = 70.0;
@@ -43,10 +44,22 @@ const LOCAL_FIRE_INTERVAL: f32 = 0.105;
 struct Args {
     #[arg(long, default_value = "127.0.0.1:5000")]
     server: SocketAddr,
+    /// Local UDP address. Set this to a physical-interface address when a
+    /// system-wide TUN proxy does not pass game UDP traffic.
+    #[arg(long, default_value = "0.0.0.0:0")]
+    local_bind: SocketAddr,
     #[arg(long)]
     name: String,
     #[arg(long, conflicts_with = "dev_unsecure")]
     connect_token: Option<PathBuf>,
+    /// HTTP room service. Omit --room to create a room and print its code.
+    #[arg(long, conflicts_with_all = ["connect_token", "dev_unsecure"])]
+    matchmaker: Option<String>,
+    /// Join an existing room code; requires --matchmaker.
+    #[arg(long, requires = "matchmaker")]
+    room: Option<String>,
+    #[arg(long, default_value_t = 300)]
+    matchmaking_timeout_seconds: u64,
     #[arg(long, default_value_t = false)]
     dev_unsecure: bool,
     /// GoldSrc BSP rendered locally. It must be the same map used by the
@@ -83,6 +96,13 @@ fn main() -> Result<()> {
     if !args.mock_payments && args.fiber_rpc.is_none() {
         bail!("choose --mock-payments or configure --fiber-rpc");
     }
+    if args.matchmaker.is_some() && args.mock_payments {
+        bail!("HTTP matchmaking requires a real local FNN; --mock-payments is not allowed");
+    }
+    if args.matchmaker.is_some() && args.matchmaking_timeout_seconds == 0 {
+        bail!("--matchmaking-timeout-seconds must be positive");
+    }
+    let connection = resolve_connection(&args)?;
 
     let map = match &args.map {
         Some(path) => {
@@ -102,7 +122,7 @@ fn main() -> Result<()> {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/models/duelist.glb")
     });
     let title = format!("OpenStrike Fiber Arena — {}", args.name);
-    let game = DesktopGame::connect(&args, map, spawn.pos, spawn.yaw, soldier_model)?;
+    let game = DesktopGame::connect(&args, connection, map, spawn.pos, spawn.yaw, soldier_model)?;
     run(
         AppConfig {
             title,
@@ -112,6 +132,67 @@ fn main() -> Result<()> {
         },
         game,
     )
+}
+
+struct ConnectionSetup {
+    server: SocketAddr,
+    connect_token: Option<ConnectToken>,
+}
+
+fn resolve_connection(args: &Args) -> Result<ConnectionSetup> {
+    let Some(matchmaker_url) = &args.matchmaker else {
+        return Ok(ConnectionSetup {
+            server: args.server,
+            connect_token: None,
+        });
+    };
+    let fiber_rpc = args
+        .fiber_rpc
+        .as_deref()
+        .context("--matchmaker requires --fiber-rpc or FIBER_RPC_URL")?;
+    let runtime = tokio::runtime::Runtime::new().context("creating matchmaking runtime")?;
+    runtime.block_on(async {
+        let node = FiberRpcClient::new(fiber_rpc)
+            .node_info()
+            .await
+            .context("reading the local FNN identity for matchmaking")?;
+        let client = MatchmakerClient::new(matchmaker_url)?;
+        let request = EnterRoomRequest {
+            name: args.name.clone(),
+            fiber_pubkey: node.pubkey,
+        };
+        let initial = match &args.room {
+            Some(room) => client.join_room(room, &request).await?,
+            None => client.create_room(&request).await?,
+        };
+        println!("ROOM CODE: {}", initial.room_code);
+        log::info!(
+            "room {} assigned slot {:?}; waiting for opponent",
+            initial.room_code,
+            initial.slot
+        );
+        let room_code = initial.room_code.clone();
+        let ticket_secret = initial.ticket.clone();
+        let ready = match client
+            .wait_until_ready(
+                initial,
+                Duration::from_secs(args.matchmaking_timeout_seconds),
+            )
+            .await
+        {
+            Ok(ready) => ready,
+            Err(error) => {
+                let _ = client.leave(&room_code, &ticket_secret).await;
+                return Err(error);
+            }
+        };
+        let (server, connect_token) = ready.ready_connection()?;
+        log::info!("room {} ready at {}", ready.room_code, server);
+        Ok(ConnectionSetup {
+            server,
+            connect_token: Some(connect_token),
+        })
+    })
 }
 
 struct Predictor {
@@ -336,20 +417,31 @@ struct DesktopGame {
 impl DesktopGame {
     fn connect(
         args: &Args,
+        connection: ConnectionSetup,
         map: MapData,
         spawn_position: Vec3,
         spawn_yaw: f32,
         soldier_model_path: PathBuf,
     ) -> Result<Self> {
-        let socket = UdpSocket::bind("0.0.0.0:0").context("binding client UDP socket")?;
+        let socket = UdpSocket::bind(args.local_bind)
+            .with_context(|| format!("binding client UDP socket to {}", args.local_bind))?;
         let client_id = unix_time().as_nanos().min(u64::MAX as u128) as u64;
-        let auth = client_authentication(
-            args.connect_token.as_deref(),
-            args.dev_unsecure,
-            args.server,
-            client_id,
-            &args.name,
-        )?;
+        let auth = match connection.connect_token {
+            Some(token) => client_authentication_with_token(
+                Some(token),
+                false,
+                connection.server,
+                client_id,
+                &args.name,
+            )?,
+            None => client_authentication(
+                args.connect_token.as_deref(),
+                args.dev_unsecure,
+                connection.server,
+                client_id,
+                &args.name,
+            )?,
+        };
         let transport = NetcodeClientTransport::new(unix_time(), auth, socket)?;
         let network = RenetClient::new(ConnectionConfig::default());
         let fiber = args.fiber_rpc.as_ref().map(FiberRpcClient::new);
@@ -360,7 +452,7 @@ impl DesktopGame {
         };
         let (payment_tx, payment_rx) = mpsc::channel();
 
-        log::info!("connecting to {}", args.server);
+        log::info!("connecting to {}", connection.server);
         let predictor = Predictor::new(spawn_position, spawn_yaw, args.dev_arena);
         Ok(Self {
             player_name: args.name.clone(),
@@ -1076,6 +1168,7 @@ impl DesktopGame {
     fn fail(&mut self, message: String) {
         if self.fatal_error.is_none() {
             log::error!("{message}");
+            self.network.disconnect();
             self.status = "NETWORK ERROR".into();
             self.fatal_error = Some(message);
         }
