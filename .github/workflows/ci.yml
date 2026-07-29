@@ -135,7 +135,10 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The script asserts on log output with ripgrep, which is not part of
+      # the GitHub Ubuntu image.
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
       # Starts a real arena server plus two headless clients on loopback and
-      # plays a full mock-payment match to completion. ripgrep (used by the
-      # script) is preinstalled on GitHub's Ubuntu images.
+      # plays a full mock-payment match to completion.
       - run: ./scripts/smoke-local.sh
