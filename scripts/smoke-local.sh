@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The assertions below grep log files for plain text such as "stage=Settled".
+# tracing-subscriber emits ANSI color codes even when writing to files, which
+# splits field names from values and breaks those greps, so disable colors.
+export NO_COLOR=1
+
 root="$(cd "$(dirname "$0")/.." && pwd)"
 port="${1:-5010}"
 log_dir="$root/work/smoke"

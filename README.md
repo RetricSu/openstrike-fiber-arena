@@ -1,5 +1,7 @@
 # OpenStrike Fiber Arena
 
+[![CI](https://github.com/RetricSu/openstrike-fiber-arena/actions/workflows/ci.yml/badge.svg)](https://github.com/RetricSu/openstrike-fiber-arena/actions/workflows/ci.yml)
+
 Native-desktop 1v1 multiplayer and event-driven Fiber payments for
 [OpenStrike](https://github.com/pocket-stack/open-strike).
 
@@ -13,6 +15,10 @@ The server defaults to a tiny deterministic arena so networking and payment
 behavior can be tested without copyrighted BSP/WAD files. With the `openstrike`
 feature and a map path, the same server runs a symmetric duel using OpenStrike's
 player/weapon logic and Pocket3D's BSP collision and character movement.
+
+**New here?** See [docs/development.md](docs/development.md) for the
+quickstart (a full match in three terminals), the build/feature matrix, and
+a five-minute explanation of the mechanism.
 
 ## MVP contract
 
@@ -216,9 +222,10 @@ cargo run --bin fiber-probe -- \
 See [docs/fiber-integration.md](docs/fiber-integration.md) for the verified
 FNN v0.9.0-rc7 flow, funded test prerequisites, trust boundary, and limitations.
 
-`vendor/open-strike` is pinned as a recursive git submodule. Clone this project
-with `--recursive`, or run `git submodule update --init --recursive` before
-building with `--features openstrike`.
+`vendor/open-strike` is pinned as a recursive git submodule. Cargo resolves
+those path dependencies on every invocation, so clone this project with
+`--recursive`, or run `git submodule update --init --recursive` before any
+`cargo` command — not just builds with `--features openstrike`.
 
 See [docs/architecture.md](docs/architecture.md) for the trust model and wire
 flow.
