@@ -153,8 +153,16 @@ cargo build --all-features --bins       # incl. desktop client
 GitHub Actions (`.github/workflows/ci.yml`) runs exactly these steps on
 every push to `main` and every pull request: rustfmt, clippy with warnings
 denied, the test suite for both feature sets, an all-features build
-(including the desktop client), a release build of the headless binaries
-published as a downloadable artifact, and the headless smoke test.
+(including the desktop client), and the headless smoke test.
+
+Player-facing release archives are built separately: pushing a `v*` tag
+triggers `.github/workflows/release.yml`, which compiles the desktop client
+plus headless binaries natively on Linux, Windows, and macOS runners and
+attaches one archive per platform to a GitHub Release (see
+[playing.md](playing.md) for what players do with them). The desktop client
+finds `assets/models/duelist.glb` relative to its own executable first, so
+the extracted archive runs without a source checkout; in a checkout the same
+lookup falls back to the crate directory and `cargo run` behaves as before.
 
 The smoke scripts assert on plain-text log lines, so they export
 `NO_COLOR=1` — tracing-subscriber would otherwise interleave ANSI color

@@ -20,6 +20,26 @@ player/weapon logic and Pocket3D's BSP collision and character movement.
 quickstart (a full match in three terminals), the build/feature matrix, and
 a five-minute explanation of the mechanism.
 
+## Download and play
+
+[Releases](https://github.com/RetricSu/openstrike-fiber-arena/releases)
+ship pre-built binaries for Linux (x86_64), Windows (x86_64), and macOS
+(Apple Silicon) — pick the archive for your platform, extract it, and play a
+local match against a bot with no Rust toolchain:
+
+```sh
+# one command per terminal; append .exe on Windows
+./arena-server --dev-unsecure --dev-signing-key
+./arena-client --name bot --dev-unsecure --mock-payments --auto-fire --exit-on-end
+./arena-desktop --name you --dev-unsecure --mock-payments --dev-arena
+```
+
+[docs/playing.md](docs/playing.md) covers platform notes (macOS quarantine,
+Windows SmartScreen, Linux GPU drivers), LAN play, and the move to real
+Fiber payments. Releases are built by
+[`.github/workflows/release.yml`](.github/workflows/release.yml) whenever a
+`v*` tag is pushed.
+
 ## MVP contract
 
 - Two players, one authoritative server, 64 simulation ticks per second.

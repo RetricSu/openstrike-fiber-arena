@@ -37,9 +37,7 @@ struct Args {
 }
 
 fn duelist_path(arg: Option<PathBuf>) -> PathBuf {
-    arg.unwrap_or_else(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/models/duelist.glb")
-    })
+    arg.unwrap_or_else(neon::default_duelist_model)
 }
 
 fn main() -> Result<()> {

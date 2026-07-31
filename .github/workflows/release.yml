@@ -1,0 +1,140 @@
+name: Release
+
+# Pushing a version tag (v*) builds the player-facing binaries on each
+# mainstream desktop platform and attaches per-platform archives to a GitHub
+# Release, so players can download and run the game without a Rust toolchain.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+          - name: windows-x86_64
+            os: windows-latest
+          - name: macos-arm64
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Cargo only needs the open-strike engine and its nested pocket3d
+      # renderer. A recursive checkout would also pull rust-psp's pinned
+      # rustc/LLVM tree, whose paths exceed the Windows path length limit.
+      - name: Checkout vendored engine submodules
+        shell: bash
+        run: |
+          git submodule update --init vendor/open-strike
+          git -C vendor/open-strike submodule update --init vendor/pocketjs
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - name: Install desktop build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libx11-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev
+      # The desktop feature implies openstrike, so one build produces the
+      # native client, the headless server/bot client, and the ops tools.
+      # arena-shot and build-duelist are development tools and stay
+      # source-only.
+      - name: Build release binaries
+        run: cargo build --locked --release --features desktop --bins
+      - name: Package archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg="openstrike-fiber-arena-${{ github.ref_name }}-${{ matrix.name }}"
+          mkdir -p "stage/$pkg/assets/models" dist
+          for bin in arena-desktop arena-server arena-client arena-admin arena-matchmaker fiber-probe; do
+            cp "target/release/$bin" "stage/$pkg/$bin"
+          done
+          # arena-desktop looks for assets/ next to the executable at runtime.
+          cp assets/models/duelist.glb assets/models/CREDITS.md "stage/$pkg/assets/models/"
+          cp docs/playing.md "stage/$pkg/PLAYING.md"
+          tar -C stage -czf "dist/$pkg.tar.gz" "$pkg"
+      - name: Package archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $pkg = "openstrike-fiber-arena-${{ github.ref_name }}-${{ matrix.name }}"
+          New-Item -ItemType Directory -Force -Path "stage/$pkg/assets/models", "dist" | Out-Null
+          foreach ($bin in 'arena-desktop','arena-server','arena-client','arena-admin','arena-matchmaker','fiber-probe') {
+            Copy-Item "target/release/$bin.exe" "stage/$pkg/$bin.exe"
+          }
+          Copy-Item assets/models/duelist.glb, assets/models/CREDITS.md "stage/$pkg/assets/models/"
+          Copy-Item docs/playing.md "stage/$pkg/PLAYING.md"
+          Compress-Archive -Path "stage/$pkg" -DestinationPath "dist/$pkg.zip"
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: artifacts
+          merge-multiple: true
+      - name: Write release notes
+        shell: bash
+        run: |
+          cat > notes.md <<'EOF'
+          Pre-built binaries for Linux (x86_64), Windows (x86_64), and macOS (Apple Silicon).
+          Pick the archive for your platform, extract it, and play a local match against a bot —
+          no Rust toolchain required:
+
+          **Linux / macOS** (one command per terminal):
+
+          ```sh
+          ./arena-server --dev-unsecure --dev-signing-key
+          ./arena-client --name bot --dev-unsecure --mock-payments --auto-fire --exit-on-end
+          ./arena-desktop --name you --dev-unsecure --mock-payments --dev-arena
+          ```
+
+          **Windows**: same three commands as `*.exe` in three PowerShell windows.
+
+          - macOS: the binaries are unsigned, so clear the quarantine flag once after
+            extracting: `xattr -dr com.apple.quarantine .`
+          - Windows: SmartScreen may warn about an unrecognized app — "More info → Run anyway".
+          - Linux: the desktop client needs a working GPU driver (Vulkan or GL).
+
+          See `PLAYING.md` inside the archive for LAN play and pointers to real Fiber payments.
+          EOF
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          generate_release_notes: true
+          files: artifacts/*
