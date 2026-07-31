@@ -30,8 +30,14 @@ jobs:
             os: macos-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      # Cargo only needs the open-strike engine and its nested pocket3d
+      # renderer. A recursive checkout would also pull rust-psp's pinned
+      # rustc/LLVM tree, whose paths exceed the Windows path length limit.
+      - name: Checkout vendored engine submodules
+        shell: bash
+        run: |
+          git submodule update --init vendor/open-strike
+          git -C vendor/open-strike submodule update --init vendor/pocketjs
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -67,8 +73,7 @@ jobs:
             cp "target/release/$bin" "stage/$pkg/$bin"
           done
           # arena-desktop looks for assets/ next to the executable at runtime.
-          cp assets/models/duelist.glb "stage/$pkg/assets/models/"
-          cp assets/CREDITS.md "stage/$pkg/assets/"
+          cp assets/models/duelist.glb assets/models/CREDITS.md "stage/$pkg/assets/models/"
           cp docs/playing.md "stage/$pkg/PLAYING.md"
           tar -C stage -czf "dist/$pkg.tar.gz" "$pkg"
       - name: Package archive (Windows)
@@ -80,8 +85,7 @@ jobs:
           foreach ($bin in 'arena-desktop','arena-server','arena-client','arena-admin','arena-matchmaker','fiber-probe') {
             Copy-Item "target/release/$bin.exe" "stage/$pkg/$bin.exe"
           }
-          Copy-Item assets/models/duelist.glb "stage/$pkg/assets/models/"
-          Copy-Item assets/CREDITS.md "stage/$pkg/assets/"
+          Copy-Item assets/models/duelist.glb, assets/models/CREDITS.md "stage/$pkg/assets/models/"
           Copy-Item docs/playing.md "stage/$pkg/PLAYING.md"
           Compress-Archive -Path "stage/$pkg" -DestinationPath "dist/$pkg.zip"
       - name: Upload archive artifact
