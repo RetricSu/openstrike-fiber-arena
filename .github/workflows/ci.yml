@@ -106,24 +106,10 @@ jobs:
       # Compile-check every binary, including the wgpu/winit desktop client
       # and the asset generators. Debug profile keeps this fast; the desktop
       # binary needs a GPU and display server at runtime, so CI only builds it.
+      # Release archives for players are built per platform by release.yml
+      # when a version tag is pushed.
       - name: Build all binaries (all features)
         run: cargo build --locked --all-features --bins
-      # Release-build the headless server-side binaries and publish them as
-      # a downloadable artifact.
-      - name: Build release binaries (headless)
-        run: cargo build --locked --release --features openstrike --bins
-      - name: Upload release binaries
-        uses: actions/upload-artifact@v4
-        with:
-          name: arena-linux-x86_64
-          path: |
-            target/release/arena-server
-            target/release/arena-client
-            target/release/arena-admin
-            target/release/arena-matchmaker
-            target/release/fiber-probe
-          if-no-files-found: error
-          retention-days: 14
 
   smoke:
     name: headless smoke test

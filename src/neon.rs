@@ -38,6 +38,32 @@ pub fn devmap_spawn(index: usize) -> Vec3 {
     devmap::spawns()[index].pos
 }
 
+/// Default path of the procedural duelist model (`assets/models/duelist.glb`).
+///
+/// Release archives ship `assets/` next to the binaries, so look relative to
+/// the current executable first, then the working directory, and finally the
+/// crate source tree (what `cargo run` sees in a checkout). When nothing
+/// exists the source-tree path is returned anyway so the load error names a
+/// sensible location.
+pub fn default_duelist_model() -> std::path::PathBuf {
+    let manifest_path =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/models/duelist.glb");
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        candidates.push(dir.join("assets/models/duelist.glb"));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("assets/models/duelist.glb"));
+    }
+    candidates.push(manifest_path.clone());
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .unwrap_or(manifest_path)
+}
+
 // ---------------------------------------------------------------------------
 // Procedural textures (64x64 RGBA)
 // ---------------------------------------------------------------------------

@@ -118,9 +118,10 @@ fn main() -> Result<()> {
         .or_else(|| map.t_spawns.first())
         .copied()
         .context("map has no player spawn")?;
-    let soldier_model = args.soldier_model.clone().unwrap_or_else(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/models/duelist.glb")
-    });
+    let soldier_model = args
+        .soldier_model
+        .clone()
+        .unwrap_or_else(neon::default_duelist_model);
     let title = format!("OpenStrike Fiber Arena — {}", args.name);
     let game = DesktopGame::connect(&args, connection, map, spawn.pos, spawn.yaw, soldier_model)?;
     run(
